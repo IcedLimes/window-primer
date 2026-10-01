@@ -1,0 +1,4 @@
+#!/bin/sh
+# window-primer CLI. Resolves its own location so it works through symlinks and from systemd.
+ROOT=$(dirname "$(dirname "$(readlink -f "$0")")")
+PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m primer "$@"
