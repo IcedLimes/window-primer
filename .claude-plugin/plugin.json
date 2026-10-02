@@ -1,7 +1,7 @@
 {
   "$schema": "https://anthropic.com/claude-code/plugin.schema.json",
   "name": "primer",
-  "version": "0.1.0",
+  "version": "1.0.0",
   "description": "Learns when you use Claude and pings at the right moment so 5-hour usage windows reset mid-session instead of after it.",
   "author": {
     "name": "IcedLimes",
