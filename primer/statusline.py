@@ -36,13 +36,13 @@ def _clock(ts):
     return f"{h}{dt.strftime(':%M') if dt.minute else ''}{'a' if dt.hour < 12 else 'p'}"
 
 
-def next_ping_label(now):
+def next_ping_label(now, skip=()):
     try:
         plan = json.loads(config.PLAN_PATH.read_text())
     except (OSError, ValueError):
         return None
     from .planner import upcoming_pings
-    nxt = upcoming_pings(plan.get("schedule", {}), now, days=7)
+    nxt = upcoming_pings(plan.get("schedule", {}), now, days=7, skip=skip)
     if not nxt:
         return None
     dt = nxt[0]
@@ -51,22 +51,29 @@ def next_ping_label(now):
 
 
 def record(rate_limits, now):
+    """Log the reading; return when /limit-reset was last used (for the hint)."""
     five = rate_limits.get("five_hour") or {}
     week = rate_limits.get("seven_day") or {}
     pct5, pctw = five.get("used_percentage"), week.get("used_percentage")
     if pct5 is None and pctw is None:
-        return
+        return None
     from . import store
     db = store.connect()
     try:
         store.add_observation(db, now, "statusline",
                               None if pct5 is None else pct5 / 100, _epoch(five.get("resets_at")),
                               None if pctw is None else pctw / 100, _epoch(week.get("resets_at")))
+        return store.last_reset_used(db)
     finally:
         db.close()
 
 
-def render(data, now):
+def _dur(minutes):
+    minutes = int(minutes)
+    return f"{minutes // 60}h{minutes % 60:02d}m" if minutes >= 60 else f"{minutes}m"
+
+
+def render(data, now, last_reset=None, skip=()):
     parts = []
     model = (data.get("model") or {}).get("display_name")
     if model:
@@ -85,7 +92,14 @@ def render(data, now):
     if week.get("used_percentage") is not None:
         pct = round(week["used_percentage"])
         parts.append(f"7d {_color(pct)}{pct}%{RESET}")
-    label = next_ping_label(now)
+    if five.get("used_percentage") is not None:
+        from .planner import reset_advice
+        save = reset_advice(five["used_percentage"] / 100, _epoch(five.get("resets_at")),
+                            None if week.get("used_percentage") is None else week["used_percentage"] / 100,
+                            last_reset, now)
+        if save:
+            parts.append(f"\033[36m/limit-reset saves {_dur(save)}{RESET}")
+    label = next_ping_label(now, skip)
     if label:
         parts.append(f"{DIM}ping {label}{RESET}")
     return f" {DIM}│{RESET} ".join(parts)
@@ -97,12 +111,13 @@ def main():
         data = json.loads(sys.stdin.read() or "{}")
     except ValueError:
         data = {}
+    last_reset = None
     try:
-        record(data.get("rate_limits") or {}, now)
+        last_reset = record(data.get("rate_limits") or {}, now)
     except Exception:  # never break the statusline over bookkeeping
         pass
     try:
-        print(render(data, now))
+        print(render(data, now, last_reset, set(config.load().get("skip_dates", []))))
     except Exception:
         print((data.get("model") or {}).get("display_name", ""))
     return 0

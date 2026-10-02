@@ -13,23 +13,26 @@ PING_OFFSET_S = 60  # fire 1 min into the slot so the API's 10-min floor lands o
 
 @dataclass
 class History:
-    act_bins: list
+    act_bins: list            # activity the simulator replays (observed + imputed lockout demand)
     act_costs: list
     first_day: object
     last_day: object
     now: float
     externals: list = field(default_factory=list)
     hits: list = field(default_factory=list)  # [(hit_ts, reset_ts)] session limit hits
+    raw: tuple = None         # (bins, costs) actually observed; calibration must not see imputed demand
+    imputed: float = 0.0
 
     def cost_between(self, t0, t1):
-        lo, hi = bisect_left(self.act_bins, to_bin(t0)), bisect_right(self.act_bins, to_bin(t1))
-        return sum(self.act_costs[lo:hi])
+        bins, costs = self.raw or (self.act_bins, self.act_costs)
+        lo, hi = bisect_left(bins, to_bin(t0)), bisect_right(bins, to_bin(t1))
+        return sum(costs[lo:hi])
 
     def without(self, b0, b1):
         """Copy with activity in bins [b0, b1) removed (for cross-validation)."""
         keep = [(b, c) for b, c in zip(self.act_bins, self.act_costs) if not b0 <= b < b1]
         return History([b for b, _ in keep], [c for _, c in keep], self.first_day, self.last_day,
-                       self.now, self.externals, self.hits)
+                       self.now, self.externals, self.hits, self.raw, self.imputed)
 
 
 def load_history(db, cfg, now=None):
@@ -60,9 +63,33 @@ def load_history(db, cfg, now=None):
             demand[s] = 0.0
             externals.append(s)
 
+    raw_bins = sorted(demand)
+    raw = (raw_bins, [demand[b] for b in raw_bins])
+    imputed = impute_lockouts(demand, hits, cfg, now)
     bins = sorted(demand)
     return History(bins, [demand[b] for b in bins], datetime.fromtimestamp(since).date(),
-                   datetime.fromtimestamp(now).date(), now, externals, hits)
+                   datetime.fromtimestamp(now).date(), now, externals, hits, raw, imputed)
+
+
+def impute_lockouts(demand, hits, cfg, now):
+    """During a real lockout you couldn't work, so the transcripts show nothing — and the optimiser
+    would conclude those hours don't matter. Fill them at a fraction of the pace of the hour before
+    the hit. Returns the $ added."""
+    factor = cfg.get("impute_lockout_factor", 0)
+    if not factor:
+        return 0.0
+    added = 0.0
+    for hit_ts, reset_ts in hits:
+        if not reset_ts:
+            continue
+        hb = to_bin(hit_ts)
+        before = sum(demand.get(b, 0.0) for b in range(hb - 6, hb + 1))
+        rate = before / 7 * factor
+        end = min(to_bin(reset_ts), hb + 1 + int(cfg["impute_lockout_max_hours"] * 3600 // BIN), to_bin(now))
+        for b in range(hb + 1, end):
+            demand[b] = demand.get(b, 0.0) + rate
+            added += rate
+    return added
 
 
 @dataclass
@@ -100,7 +127,7 @@ def calibrate(db, hist, cfg):
     # Limits and model mix drift, so recent estimates count more; utilization readings know the exact
     # window start, so they count double. Rather than trust one number, the planner hedges across all
     # of them (usage outside Claude Code makes estimates read low, which only errs toward pinging).
-    hl = cfg["half_life_days"] * 86400
+    hl = cfg["budget_half_life_days"] * 86400
     for e in estimates:
         e["weight"] = 0.5 ** (max(hist.now - e["ts"], 0) / hl) * (2 if e["source"] == "utilization" else 1)
     pairs = [(e["budget"], e["weight"]) for e in estimates]
@@ -159,8 +186,24 @@ class Scorer:
         self.wbins = int(cfg["window_hours"] * 3600 // BIN)
         self.weighted = weighted
         self._wd = {}
+        self._totals = {}
+        self._weights = {}
         self.now_bin = to_bin(hist.now)
         self.hl_bins = cfg["half_life_days"] * 86400 / BIN
+        # Local midnight of every day in the history, by weekday (computed once; DST-correct).
+        self.midnights = [[] for _ in range(7)]
+        day = hist.first_day
+        while day <= hist.last_day:
+            self.midnights[day.weekday()].append(datetime.combine(day, datetime.min.time()).timestamp())
+            day += timedelta(days=1)
+
+    def ping_bins(self, schedule):
+        step = self.cfg["bin_minutes"] * 60
+        out = [to_bin(m + slot * step + PING_OFFSET_S)
+               for wd, slots in schedule.items() for slot in slots for m in self.midnights[wd]
+               if m + slot * step + PING_OFFSET_S <= self.hist.now]
+        out.sort()
+        return out
 
     def weekday(self, b):
         wd = self._wd.get(b)
@@ -169,29 +212,47 @@ class Scorer:
         return wd
 
     def windows(self, schedule, detail=False):
-        pings = ping_bins(schedule, self.hist.first_day, self.hist.last_day, self.hist.now, self.cfg["bin_minutes"])
-        return simulate(self.hist.act_bins, self.hist.act_costs, pings, self.wbins, detail)
+        return simulate(self.hist.act_bins, self.hist.act_costs, self.ping_bins(schedule), self.wbins, detail)
 
     def window_score(self, w):
-        weight = 0.5 ** ((self.now_bin - w.start) / self.hl_bins) if self.weighted else 1.0
-        L = w.load
-        if not self.budget.dist:
-            return weight * L * L, 0.0
-        mw, m = self.cfg["margin_weight"], self.cfg["margin"]
-        main = sum(p * (max(0.0, L - B) + mw * max(0.0, L - m * B)) for B, p in self.budget.dist)
-        return weight * main, weight * L * L / self.budget.point
+        return self.score([w])
 
     def score(self, windows, select=None):
+        # Hot path (tens of thousands of calls per plan): most windows sit below every margin, so
+        # they only add to the tie-break; the per-budget sum runs only for the rest.
+        dist = self.budget.dist
+        if dist and not hasattr(self, "_floor"):
+            m = self.cfg["margin"]
+            self._floor = m * min(B for B, _ in dist)
+            self._terms = [(B, m * B, p, p * self.cfg["margin_weight"]) for B, p in dist]
+        weights = self._weights if self.weighted else None
         main = tie = 0.0
         for w in windows:
-            if select is None or select(w):
-                a, b = self.window_score(w)
-                main += a
-                tie += b
+            if select is not None and not select(w):
+                continue
+            if weights is None:
+                wt = 1.0
+            else:
+                wt = weights.get(w.start)
+                if wt is None:
+                    wt = weights[w.start] = 0.5 ** ((self.now_bin - w.start) / self.hl_bins)
+            L = w.load
+            if not dist:
+                main += wt * L * L
+                continue
+            tie += wt * L * L
+            if L > self._floor:
+                main += wt * sum(p * (L - B if L > B else 0.0) + pm * (L - mB) for B, mB, p, pm in self._terms if L > mB)
+        if dist:
+            tie /= self.budget.point
         return main, tie
 
     def total(self, schedule):
-        return self.score(self.windows(schedule))
+        key = tuple(tuple(schedule.get(wd, ())) for wd in range(7))
+        hit = self._totals.get(key)
+        if hit is None:
+            hit = self._totals[key] = self.score(self.windows(schedule))
+        return hit
 
     def weekday_score(self, schedule, wd):
         return self.score(self.windows(schedule), lambda w: self.weekday(w.start) == wd)
@@ -217,9 +278,24 @@ def _better(a, b, tol):
     return a[0] < b[0] - tol or (abs(a[0] - b[0]) <= tol and a[1] < b[1] - 1e-12)
 
 
+def weekday_day_counts(hist):
+    counts = [0] * 7
+    day = hist.first_day
+    while day <= hist.last_day:
+        counts[day.weekday()] += 1
+        day += timedelta(days=1)
+    return counts
+
+
 def optimize(hist, budget, cfg, weighted=True):
-    """Pick ping slots. mode 'global' = same times every day (35 samples per decision, robust);
-    'weekday' = per-weekday times (5 samples per decision, tends to overfit)."""
+    """Pick ping slots.
+
+    mode 'global'  — same times every day: ~35 days behind each decision, robust.
+    mode 'weekday' — each weekday on its own: ~5 days behind each decision, overfits.
+    mode 'pooled'  — empirical-Bayes partial pooling: each weekday's gain curve is shrunk toward
+                     the all-days curve with weight κ/(n+κ), so a weekday moves away from the
+                     shared times only as far as its own n days justify (κ = pool_kappa days).
+    """
     sc = Scorer(hist, budget, cfg, weighted)
     per_hour = 60 // cfg["bin_minutes"]
     all_slots = list(range(24 * per_hour))
@@ -227,58 +303,77 @@ def optimize(hist, budget, cfg, weighted=True):
     allowed = set(range(int(lo * per_hour), int(hi * per_hour)))
     radius = cfg.get("smooth_slots", 0)
     mode = cfg.get("mode", "global")
+    kappa = cfg.get("pool_kappa", 5.0) if mode == "pooled" else 0.0
+    counts = weekday_day_counts(hist)
     schedule = {wd: [] for wd in range(7)}
     if not hist.act_bins:
         return schedule
     tol = 1e-9
 
-    def best_addition(days, base):
+    def with_slot(base_of, days, s):
         trial = dict(schedule)
         for wd in days:
-            trial[wd] = list(base)
-        base_total = sc.total(trial)
-        base_days = sum(sc.weekday_score(trial, wd)[0] for wd in days)
-        curve = []
-        for s in all_slots:
-            if s in base:
-                curve.append(base_total)
-                continue
-            for wd in days:
-                trial[wd] = sorted(base + [s])
-            curve.append(sc.total(trial))
-        curve = _smooth(curve, radius)
-        best, best_val = None, base_total
-        for s in all_slots:
-            if s in allowed and s not in base and _better(curve[s], best_val, tol):
-                best, best_val = s, curve[s]
-        gain = base_total[0] - best_val[0]
-        if best is not None and gain > tol and gain >= cfg["min_gain_frac"] * base_days:
-            return sorted(base + [best])
-        return list(base)
+            trial[wd] = sorted(set(base_of(wd)) | ({s} if s is not None else set()))
+        return trial
 
-    groups = [tuple(range(7))] if mode == "global" else [(wd,) for wd in range(7)]
-    for _ in range(2):  # coordinate descent: a ping can shift windows into the next day
-        changed = False
-        for days in groups:
-            new = best_addition(days, [])
-            changed |= any(new != schedule[wd] for wd in days)
-            for wd in days:
+    def gain_curve(base_of, days):
+        """Change in the total objective from adding slot s on `days`, for every slot."""
+        base = sc.total(with_slot(base_of, days, None))
+        return [(0.0, 0.0) if all(s in base_of(wd) for wd in days) else
+                tuple(x - y for x, y in zip(sc.total(with_slot(base_of, days, s)), base)) for s in all_slots]
+
+    def pick(gains, base_of, days, baseline_main):
+        gains = _smooth(gains, radius)
+        best, best_val = None, (0.0, 0.0)
+        for s in all_slots:
+            if s in allowed and not any(s in base_of(wd) for wd in days) and _better(gains[s], best_val, tol):
+                best, best_val = s, gains[s]
+        if best is not None and -best_val[0] > tol and -best_val[0] >= cfg["min_gain_frac"] * baseline_main:
+            return best
+        return None
+
+    def stage(base_of, eligible):
+        """One round of adding at most one ping per group on top of base_of(wd), on `eligible` days."""
+        if not eligible:
+            return
+        if mode == "global":
+            s = pick(gain_curve(base_of, eligible), base_of, eligible,
+                     sc.total(with_slot(base_of, eligible, None))[0])
+            if s is not None:
+                for wd in eligible:
+                    schedule[wd] = sorted(set(base_of(wd)) | {s})
+            return
+        prior = gain_curve(base_of, eligible) if kappa else None
+        all_main = sc.total(with_slot(base_of, eligible, None))[0] if kappa else 0.0
+        for _ in range(2):  # coordinate descent: a ping can shift windows into the next day
+            changed = False
+            for wd in eligible:
+                own = gain_curve(base_of, (wd,))
+                baseline = sc.weekday_score(with_slot(base_of, (wd,), None), wd)[0]
+                if kappa:
+                    w = kappa / (counts[wd] + kappa)
+                    n = len(eligible)
+                    own = [((1 - w) * g[0] + w * p[0] / n, (1 - w) * g[1] + w * p[1] / n) for g, p in zip(own, prior)]
+                    baseline = (1 - w) * baseline + w * all_main / n
+                s = pick(own, base_of, (wd,), baseline)
+                new = sorted(set(base_of(wd)) | ({s} if s is not None else set()))
+                changed |= new != schedule[wd]
                 schedule[wd] = new
-        if not changed or mode == "global":
-            break
+            if not changed:
+                break
+
+    stage(lambda wd: [], tuple(range(7)))
     for _ in range(cfg["max_pings_per_day"] - 1):
-        for days in groups:
-            if schedule[days[0]]:
-                new = best_addition(days, schedule[days[0]])
-                for wd in days:
-                    schedule[wd] = new
-    # Drop pings that made no measurable difference on a weekday (e.g. a light Friday).
-    for wd in range(7):
-        if schedule[wd]:
-            trial = dict(schedule)
-            trial[wd] = []
-            if sc.total(trial)[0] <= sc.total(schedule)[0] + tol:
-                schedule[wd] = []
+        current = {wd: list(v) for wd, v in schedule.items()}
+        stage(lambda wd, current=current: current[wd], tuple(wd for wd in range(7) if current[wd]))
+    if mode != "pooled":
+        # Drop pings that made no measurable difference on a weekday (e.g. a light Friday).
+        for wd in range(7):
+            if schedule[wd]:
+                trial = dict(schedule)
+                trial[wd] = []
+                if sc.total(trial)[0] <= sc.total(schedule)[0] + tol:
+                    schedule[wd] = []
     return schedule
 
 
@@ -325,7 +420,7 @@ def cross_validate(hist, budget, cfg):
     return agg
 
 
-VARIANTS = [("global", 1), ("global", 2), ("weekday", 1), ("weekday", 2)]
+VARIANTS = [("global", 1), ("global", 2), ("pooled", 1), ("pooled", 2), ("weekday", 1), ("weekday", 2)]
 
 
 def choose_variant(hist, budget, cfg):
@@ -396,19 +491,62 @@ def plan(db, cfg, now=None):
         "baseline": backtest(hist, budget, cfg, none),
         "planned": backtest(hist, budget, cfg, schedule),
         "cv": cv_rows,
+        "real_world": real_world(db, hist),
+        "imputed_usd": hist.imputed,
     }
     return result, hist
 
 
-def upcoming_pings(plan_schedule, now=None, days=7, bin_minutes=10):
+def upcoming_pings(plan_schedule, now=None, days=7, bin_minutes=10, skip=()):
     now = now or time.time()
     out = []
     today = datetime.fromtimestamp(now).date()
     for i in range(days + 1):
         day = today + timedelta(days=i)
+        if day.isoformat() in skip:
+            continue
         for label in plan_schedule.get(WEEKDAYS[day.weekday()], []):
             h, m = map(int, label.split(":"))
             dt = datetime.combine(day, datetime.min.time()) + timedelta(hours=h, minutes=m)
             if dt.timestamp() > now:
                 out.append(dt)
     return sorted(out)
+
+
+RESET_COOLDOWN_S = 7 * 86400  # /limit-reset is rationed to roughly once a week
+
+
+def reset_advice(five_util, five_resets_at, week_util, last_reset_ts, now, min_saving_min=45):
+    """Minutes a /limit-reset would save right now, if it's worth spending, else None.
+    Worth it when the window is (nearly) exhausted with a long wait left, the weekly limit has room
+    (a reset draws on it), and no reset was used in the last week."""
+    if five_util is None or five_util < 0.9 or not five_resets_at:
+        return None
+    remaining = (five_resets_at - now) / 60
+    if remaining < min_saving_min:
+        return None
+    if week_util is not None and week_util >= 0.9:
+        return None
+    if last_reset_ts and now - last_reset_ts < RESET_COOLDOWN_S:
+        return None
+    return remaining
+
+
+def real_world(db, hist):
+    """Actual limit hits and lockout time before vs since scheduled pings began."""
+    row = db.execute("SELECT min(ts) FROM pings WHERE scheduled IN ('timer', 'cloud') "
+                     "AND outcome IN ('opened', 'inside-window')").fetchone()
+    start = row[0] if row else None
+    out = {"pings_started": start}
+    if not start:
+        return out
+    since = datetime.combine(hist.first_day, datetime.min.time()).timestamp()
+    for name, t0, t1 in (("before", since, start), ("since", start, hist.now)):
+        hits = [(h, r) for h, r in hist.hits if t0 <= h < t1 and r]
+        days = max((t1 - t0) / 86400, 1e-9)
+        out[name] = {"days": days, "hits": len(hits),
+                     "hits_per_week": len(hits) / days * 7,
+                     "lockout_min_per_week": sum((r - h) / 60 for h, r in hits) / days * 7}
+    out["opened"] = db.execute("SELECT count(*) FROM pings WHERE scheduled IN ('timer', 'cloud') "
+                               "AND outcome = 'opened'").fetchone()[0]
+    return out

@@ -68,6 +68,10 @@ def active_window_until(db, now):
 def run(cfg, db, scheduled=None, force=False, runner=subprocess.run, sleep=time.sleep):
     now = time.time()
     wsec = cfg["window_hours"] * 3600
+    if not force and time.strftime("%Y-%m-%d", time.localtime(now)) in cfg.get("skip_dates", []):
+        db.execute("INSERT INTO pings VALUES (?,?,?,?,?)", (now, scheduled, "skipped", None, "day off (primer skip)"))
+        db.commit()
+        return "skipped", "day off (primer skip)"
     if not force:
         until = active_window_until(db, now)
         if until:

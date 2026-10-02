@@ -22,6 +22,9 @@ building this; anything that might change is read defensively.
 | Plugins can't provide a statusline or run on a timer | Plugin components are commands/skills/hooks/MCP; `statusLine` is settings-only, and nothing in a plugin runs while Claude Code is closed, so scheduling uses systemd (and optionally a cloud cron). |
 | User hooks would fire on pings | A Stop hook that plays a sound would go off at 7 am, so pings run with `--safe-mode` and `disableAllHooks`. |
 | Per-model price tiers | Taken from Claude Code's model catalog; used only as relative weights (see §3). |
+| Limits change often | Anthropic has run promotions, doubled 5-hour limits (May 2026) and cut them again (September 2026), so old evidence about the budget goes stale within weeks. |
+| One lockout can log several limit messages | Claude Code printed three "You've hit your session limit" messages for a single window; hits are deduplicated by reset time. |
+| Sessions can be reset once in a while | `/limit-reset` (Claude Code 2.1.x) clears the current 5-hour limit; it is rationed (reportedly once a week) and draws on the weekly limit. |
 
 ## 2. Architecture
 
@@ -35,7 +38,7 @@ window-primer/                     ← repo == Claude Code plugin root
   primer/
     config.py     paths + config.json defaults
     pricing.py    model → price tier → API-equivalent $ per response ("intensity")
-    store.py      sqlite: events, limit_hits, observations, pings, files
+    store.py      sqlite: events, limit_hits, observations, pings, resets_used, files
     ingest.py     incremental transcript scan → events + limit hits
     sim.py        5-hour window simulator (10-min bins)
     planner.py    calibration, optimisation, backtest, cross-validation
@@ -79,8 +82,15 @@ have no Claude Code activity are replayed as zero-cost "external" events.
 with ≥ 15 % utilization gives `load / utilization` (one per window). Usage outside Claude
 Code is invisible here and only makes these estimates read low, and limits/model mix
 drift over time, so the planner doesn't trust a single number: it **hedges across the
-recency-weighted distribution of estimates** (readings count double). The median is shown
-for display and replay.
+recency-weighted distribution of estimates** (readings count double, half-life 7 days — shorter
+than the 21-day half-life for usage patterns, because limits change faster than habits). The
+median is shown for display and replay.
+
+**Blocked work.** During a real lockout the transcripts show nothing, which would teach the
+optimiser that those hours don't matter — exactly the hours a better ping would rescue. So
+each lockout is filled at half the pace of the 70 minutes before the hit (for at most 3 h,
+`impute_lockout_factor`). Calibration only ever sees observed usage. The schedule choice was
+the same with the factor at 0, 0.25 and 0.5; only the size of the estimated gain changes.
 
 **Objective per window**, recency-weighted (half-life 21 days), averaged over the budget
 distribution: `max(0, L − B) + 0.2·max(0, L − 0.8B)`, with a tiny `L²/B` tie-break that
@@ -92,11 +102,22 @@ over ±30 min so a small wobble in your start time doesn't turn a good slot into
 Optionally add a second ping per day. Pings that make no measurable difference on a weekday
 are dropped.
 
+**Partial pooling.** Between "one schedule for every day" and "each weekday on its own" sits
+empirical-Bayes shrinkage: each weekday's gain curve is blended with the all-days curve with
+weight κ/(n+κ), where n is how many of that weekday are in the history (κ = `pool_kappa`,
+5 days). A weekday drifts from the shared times only as far as its own evidence justifies.
+
 **Choosing the schedule shape by cross-validation.** Per-weekday schedules only have ~5
 examples per decision and overfit badly; in testing they made held-out weeks *worse*. So
-`mode: auto` runs leave-one-week-out cross-validation for {global, per-weekday} × {1, 2}
-pings/day and keeps the simplest variant within 1% of the best held-out score, but only if
-it beats not pinging by `min_gain_frac`. Otherwise nothing is scheduled.
+`mode: auto` runs leave-one-week-out cross-validation for {global, pooled, per-weekday} ×
+{1, 2} pings/day and keeps the simplest variant within 1% of the best held-out score, but only
+if it beats not pinging by `min_gain_frac`. Otherwise nothing is scheduled. With five weeks of
+history the ranking has consistently been global > pooled > per-weekday; pooling is there to
+take over as history grows.
+
+**Spending `/limit-reset` well.** The statusline and `primer status` suggest the reset only
+when it buys a lot: the window is ≥ 90 % used with ≥ 45 min left, the weekly limit is under
+90 %, and no reset shows up in the transcripts for the past week.
 
 **Ping timing.** Pings fire 1 minute into their slot (e.g. `09:21`) so the API's 10-minute
 floor lands on the intended slot.
@@ -118,6 +139,13 @@ floor lands on the intended slot.
 - **Own data store** — Claude Code deletes transcripts after `cleanupPeriodDays` (default 30);
   the sqlite store keeps per-response history independently.
 
+**Checking against reality.** Once scheduled pings start, `primer report` compares actual
+limit hits and lockout time per week before vs since, which is the only test that counts.
+
+**Speed.** A plan simulates ~60k schedules (6 variants × 5 folds of cross-validation). Totals
+are memoised per schedule, ping times come from precomputed local midnights, and windows that
+sit below every budget skip the per-budget sum; a full plan takes under 10 s.
+
 ## 5. Cloud runner
 
 Railway cron runs in UTC, at least 5 minutes apart, and can start a few minutes late. The
@@ -126,8 +154,8 @@ the standard and daylight UTC offsets; the runner decides in local time whether 
 actually due (late by up to 30 min is still accepted, and up to ~8 min still lands in the
 intended slot). Local `primer refresh` pushes the schedule (`PRIMER_SCHEDULE`) and cron via
 the Railway CLI, retrying when the network isn't back yet, and `primer status` pulls ping
-results back from the service logs. The local timer stays on as a backup; a second ping in
-an open window is a no-op.
+results back from the service logs. Days off (`primer skip`) travel with the schedule. The local
+timer stays on as a backup; a second ping in an open window is a no-op.
 
 ## 6. Limits
 

@@ -57,6 +57,7 @@ primer report
 | `primer report` | weekday × time heatmap, calibrated budget, schedule, replay, held-out-week results |
 | `primer refresh` | re-ingest, re-plan, update the timers (also runs daily and on session start if stale) |
 | `primer ping [--force]` | open a window now (skips if one is known to be open) |
+| `primer skip DATE… / --remove / --clear` | days with no pings, e.g. `primer skip tomorrow 2026-12-25` |
 | `primer config [key [value]]` | settings, e.g. `primer config ping_hours '[7, 23]'` |
 | `primer cloud link\|sync\|pull\|cron` | manage the cloud runner |
 
@@ -64,19 +65,27 @@ In Claude Code: `/primer:status`, `/primer:report`, `/primer:replan`, `/primer:p
 "when does my limit reset?".
 
 Useful settings: `ping_hours` (only ping inside these local hours), `max_pings_per_day`,
-`mode` (`auto` | `global` | `weekday`), `budget_override_usd`, `lookback_days`.
+`mode` (`auto` | `global` | `pooled` | `weekday`), `pool_kappa`, `budget_override_usd`,
+`lookback_days`, `impute_lockout_factor`.
+
+When your window is nearly spent with a long wait left, the statusline and `primer status`
+point out how much a `/limit-reset` would save — but only if the weekly limit has room and you
+haven't used one in the past week, since it's rationed.
 
 ## How it decides
 
 1. Every response in `~/.claude/projects/**` becomes an API-equivalent cost (its "intensity"),
    kept in a local sqlite store so it outlives Claude Code's transcript cleanup.
 2. The per-window budget is calibrated from your real limit-hit messages and live utilization
-   readings (statusline + pings). The planner hedges across all estimates, weighted toward
-   recent ones.
+   readings (statusline + pings). Limits change every few months, so the planner hedges across
+   all estimates with a one-week half-life.
 3. A simulator replays your history under candidate ping times — windows open at the first
    request, floored to 10 minutes, and last 5 hours; a ping inside an open window does nothing.
-4. Same-time-every-day and per-weekday schedules with 1–2 pings are cross-validated week by
-   week; the simplest one that actually helps on held-out weeks wins.
+   Work you were locked out of is estimated, so the hours a better ping would rescue count.
+4. Same-time-every-day, partially pooled (empirical Bayes) and per-weekday schedules with 1–2
+   pings are cross-validated week by week; the simplest one that actually helps on held-out
+   weeks wins.
+5. Once pings run, the report compares real limit hits and lockout time before vs since.
 
 Details and the evidence behind each choice: [docs/DESIGN.md](docs/DESIGN.md).
 

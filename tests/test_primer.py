@@ -133,28 +133,92 @@ class Planner(unittest.TestCase):
         self.assertEqual(planner.weighted_quantile([(10, 1), (20, 1), (30, 2)], 0.5), 20)
 
 
-class DuplicateLimitHits(unittest.TestCase):
-    def test_duplicate_limit_messages_count_once(self):
-        db = store.connect(":memory:")
-        hit, reset = local_ts("2026-09-22 18:00"), local_ts("2026-09-22 19:40")
+def mixed_history(days=28, start="2026-09-01"):
+    """Saturdays: work 08:00–18:00. Other days: 13:00–23:00. $1 per 10 min."""
+    t0 = local_ts(f"{start} 00:00")
+    bins, costs = [], []
+    for d in range(days):
+        midnight = t0 + d * 86400
+        h0, h1 = (8, 18) if datetime.fromtimestamp(midnight).weekday() == 5 else (13, 23)
+        for slot in range(h0 * 6, h1 * 6):
+            bins.append(sim.to_bin(midnight + slot * 600))
+            costs.append(1.0)
+    now = t0 + days * 86400
+    return planner.History(bins, costs, datetime.fromtimestamp(t0).date(),
+                           datetime.fromtimestamp(now - 1).date(), now)
+
+
+class Pooling(unittest.TestCase):
+    BUDGET = planner.Budget(25.0, [(25.0, 1.0)], "test")
+
+    def plan(self, **kw):
+        cfg = dict(CFG, max_pings_per_day=1, smooth_slots=0, **kw)
+        return planner.optimize(mixed_history(), self.BUDGET, cfg)
+
+    def test_weak_pooling_lets_saturday_differ(self):
+        sched = self.plan(mode="pooled", pool_kappa=0.01)
+        self.assertNotEqual(sched[5], sched[0], sched)
+        self.assertLess(sched[5][0], sched[0][0])  # Saturday starts earlier, so it pings earlier
+
+    def test_strong_pooling_pulls_saturday_toward_the_rest(self):
+        weak, strong = self.plan(mode="pooled", pool_kappa=0.01), self.plan(mode="pooled", pool_kappa=1000)
+        self.assertLessEqual(abs(strong[5][0] - strong[0][0]), abs(weak[5][0] - weak[0][0]))
+
+    def test_weekday_mode_matches_zero_pooling(self):
+        self.assertEqual(self.plan(mode="weekday"), self.plan(mode="pooled", pool_kappa=0.0))
+
+
+class HistoryLoading(unittest.TestCase):
+    def setUp(self):
+        self.db = store.connect(":memory:")
+        self.hit = local_ts("2026-09-22 18:00")
+        self.reset = local_ts("2026-09-22 19:40")
+        for i in range(12):  # $1 per 10 min for the 2 hours before the hit
+            self.db.execute("INSERT INTO events VALUES (?,?,?,?,?)",
+                            (f"m{i}", self.hit - 7200 + i * 600, "claude-opus-5", 1.0, 0))
         for offset in (0, 120, 300):  # one lockout, reported three times
-            db.execute("INSERT INTO limit_hits VALUES (?,?,?,?)", (hit + offset, reset, "session", ""))
-        hist = planner.load_history(db, CFG, local_ts("2026-09-25 12:00"))
+            self.db.execute("INSERT INTO limit_hits VALUES (?,?,?,?)", (self.hit + offset, self.reset, "session", ""))
+        self.now = local_ts("2026-09-25 12:00")
+
+    def tearDown(self):
+        self.db.close()
+
+    def test_duplicate_limit_messages_count_once(self):
+        hist = planner.load_history(self.db, dict(CFG, impute_lockout_factor=0), self.now)
         self.assertEqual(len(hist.hits), 1)
-        db.close()
+
+    def test_lockout_demand_is_imputed_but_hidden_from_calibration(self):
+        cfg = dict(CFG, impute_lockout_factor=0.5, impute_lockout_max_hours=3)
+        hist = planner.load_history(self.db, cfg, self.now)
+        # Pace over the 70 min up to the hit: $6 in 7 slots; half of that, for the 9 slots between
+        # the hit's slot and the reset.
+        self.assertAlmostEqual(hist.imputed, 6 / 7 * 0.5 * 9)
+        self.assertAlmostEqual(hist.cost_between(self.hit - 7200, self.reset), 12.0)
+        self.assertGreater(sum(hist.act_costs), 12.0)
 
 
-class ScheduledPingGuard(unittest.TestCase):
-    def test_timer_firing_off_schedule_does_not_ping(self):
-        from primer import cli
-        import contextlib, io
-        config.PLAN_PATH.write_text(json.dumps({"schedule": {d: [] for d in planner.WEEKDAYS}}))
-        out = io.StringIO()
-        with contextlib.redirect_stdout(out):
-            self.assertEqual(cli.main(["ping", "--scheduled"]), 0)
-        self.assertIn("not due", out.getvalue())
-        db = store.connect()
-        self.assertEqual(db.execute("select count(*) from pings").fetchone()[0], 0)
+class ResetAdvice(unittest.TestCase):
+    def test_advises_only_when_worth_it(self):
+        now = 1_000_000.0
+        self.assertAlmostEqual(planner.reset_advice(0.97, now + 7200, 0.5, None, now), 120)
+        self.assertIsNone(planner.reset_advice(0.6, now + 7200, 0.5, None, now))        # room left
+        self.assertIsNone(planner.reset_advice(0.97, now + 1200, 0.5, None, now))       # resets soon anyway
+        self.assertIsNone(planner.reset_advice(0.97, now + 7200, 0.95, None, now))      # weekly nearly gone
+        self.assertIsNone(planner.reset_advice(0.97, now + 7200, 0.5, now - 86400, now))  # used this week
+
+
+class RealWorld(unittest.TestCase):
+    def test_before_vs_since(self):
+        db = store.connect(":memory:")
+        start = local_ts("2026-09-15 09:21")
+        db.execute("INSERT INTO pings VALUES (?,?,?,?,?)", (start, "timer", "opened", start + 18000, ""))
+        hist = planner.History([], [], datetime(2026, 9, 1).date(), datetime(2026, 9, 28).date(),
+                               local_ts("2026-09-29 00:00"),
+                               hits=[(local_ts("2026-09-03 18:00"), local_ts("2026-09-03 20:00")),
+                                     (local_ts("2026-09-08 18:00"), local_ts("2026-09-08 19:00"))])
+        rw = planner.real_world(db, hist)
+        self.assertEqual((rw["before"]["hits"], rw["since"]["hits"], rw["opened"]), (2, 0, 1))
+        self.assertAlmostEqual(rw["before"]["lockout_min_per_week"], 180 / ((start - local_ts("2026-09-01 00:00")) / 86400) * 7)
         db.close()
 
 
@@ -201,11 +265,31 @@ class PingRun(unittest.TestCase):
         self.assertEqual((outcome, len(calls)), ("error", 2))
         self.assertIn("network down", detail)
 
+    def test_skips_days_off(self):
+        cfg = dict(self.cfg, skip_dates=[time.strftime("%Y-%m-%d")])
+        outcome, detail = ping.run(cfg, self.db, runner=lambda *a, **k: self.fail("should not run"))
+        self.assertEqual(outcome, "skipped")
+        self.assertIn("day off", detail)
+
     def test_command_disables_hooks_and_tools(self):
         cmd = ping.ping_command(self.cfg)
         self.assertIn("--safe-mode", cmd)
         self.assertIn('{"disableAllHooks":true}', cmd)
         self.assertEqual(cmd[cmd.index("--tools") + 1], "")
+
+
+class ScheduledPingGuard(unittest.TestCase):
+    def test_timer_firing_off_schedule_does_not_ping(self):
+        from primer import cli
+        import contextlib, io
+        config.PLAN_PATH.write_text(json.dumps({"schedule": {d: [] for d in planner.WEEKDAYS}}))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cli.main(["ping", "--scheduled"]), 0)
+        self.assertIn("not due", out.getvalue())
+        db = store.connect()
+        self.assertEqual(db.execute("select count(*) from pings").fetchone()[0], 0)
+        db.close()
 
 
 class Ingest(unittest.TestCase):
@@ -225,6 +309,20 @@ class Ingest(unittest.TestCase):
         self.assertEqual(db.execute("select count(*), sum(cost) from events").fetchone()[:], (1, 0.025))
         self.assertEqual(db.execute("select reset_ts from limit_hits").fetchone()[0], local_ts("2026-09-01 18:50"))
         self.assertEqual(ingest.ingest(db, root), 0)  # unchanged files are skipped
+        db.close()
+
+    def test_detects_limit_reset_command_not_mentions(self):
+        root = Path(tempfile.mkdtemp())
+        (root / "proj").mkdir()
+        tag = "<command-name>/limit-reset</command-name>"
+        real = {"type": "user", "timestamp": "2026-09-30T05:00:00Z",
+                "message": {"role": "user", "content": tag + "\n<command-message>limit-reset</command-message>"}}
+        quoted = {"type": "user", "timestamp": "2026-09-30T06:00:00Z",
+                  "message": {"role": "user", "content": [{"type": "tool_result", "content": "grep found " + tag}]}}
+        (root / "proj/a.jsonl").write_text("\n".join(json.dumps(x) for x in (real, quoted)) + "\n")
+        db = store.connect(":memory:")
+        ingest.ingest(db, root)
+        self.assertEqual(db.execute("select count(*) from resets_used").fetchone()[0], 1)
         db.close()
 
 
@@ -267,6 +365,8 @@ class Cloud(unittest.TestCase):
         self.assertIsNone(cloud.due(self.SCHED, self.TZ, datetime(2026, 9, 30, 9, 24, tzinfo=tz)))  # Wed
         # winter: the PST cron run at 17:21 UTC is 09:21 local
         self.assertIsNotNone(cloud.due(self.SCHED, self.TZ, datetime(2026, 12, 1, 9, 21, tzinfo=tz)))
+        # a day off
+        self.assertIsNone(cloud.due(self.SCHED, self.TZ, tue, skip={"2026-09-29"}))
 
     def test_sync_retries_then_records_state(self):
         calls = []

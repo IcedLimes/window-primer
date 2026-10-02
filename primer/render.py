@@ -3,7 +3,7 @@
 import time
 from datetime import datetime
 
-from .planner import WEEKDAYS, upcoming_pings, weekday_profile
+from .planner import WEEKDAYS, reset_advice, upcoming_pings, weekday_profile
 
 LEVELS = " ·▁▂▃▄▅▆▇█"
 
@@ -88,8 +88,19 @@ def report(result, hist, cfg):
                        f"   over-budget windows {b['hits']} → {p['hits']}")
         else:
             out.append(f"  {r['mode']:<7} ≤{r['pings']} ping/day   Σload² {b['sum_sq']:.0f} → {p['sum_sq']:.0f}")
-    out.append("\nCaveats: claude.ai/phone usage is only visible through limit hits and live readings; the replay "
-               "can't see work you would have done during real lockouts, so gains are understated.")
+    rw = result.get("real_world") or {}
+    out.append("")
+    if rw.get("since") and rw["since"]["days"] >= 1:
+        b, a = rw["before"], rw["since"]
+        out.append(f"Real world — before scheduled pings vs since ({a['days']:.0f} days, {rw['opened']} window(s) opened by pings):")
+        out.append(f"  limit hits per week        {b['hits_per_week']:9.1f}   {a['hits_per_week']:9.1f}")
+        out.append(f"  lockout per week           {_dur(b['lockout_min_per_week']):>9}   {_dur(a['lockout_min_per_week']):>9}")
+    else:
+        out.append("Real world: no scheduled pings yet — this section compares before vs after once they start.")
+    if result.get("imputed_usd"):
+        out.append(f"(Replay includes ${result['imputed_usd']:.0f} of estimated work blocked by past lockouts.)")
+    out.append("\nCaveats: claude.ai/phone usage is only visible through limit hits and live readings; work blocked "
+               "by past lockouts is estimated (impute_lockout_factor), not observed.")
     return "\n".join(out)
 
 
@@ -109,16 +120,25 @@ def status(db, plan, cfg, timer_line=None):
             out.append(f"7-day limit:   {round(obs['week_util'] * 100)}% used, resets "
                        f"{datetime.fromtimestamp(obs['week_resets_at']):%a %m-%d %H:%M}"
                        + ("  ← pings can't help with this one" if obs["week_util"] >= 0.8 else ""))
+        save = reset_advice(obs["five_util"], obs["five_resets_at"], obs["week_util"],
+                            db.execute("SELECT max(ts) FROM resets_used").fetchone()[0], now)
+        if save:
+            out.append(f"Tip:           /limit-reset now would save {_dur(save)} of waiting "
+                       "(rationed — roughly once a week)")
     else:
         out.append("No live readings yet (they come from the statusline and from pings).")
+    skip = set(cfg.get("skip_dates", []))
     if plan:
-        upcoming = upcoming_pings(plan["schedule"], now, days=7)
+        upcoming = upcoming_pings(plan["schedule"], now, days=7, skip=skip)
         out.append(f"Plan from {_when(plan['generated_at'])}: {plan['reason']}")
         out.append("Next pings:    " + (", ".join(dt.strftime("%a %H:%M") for dt in upcoming[:6]) or "none scheduled"))
         if plan.get("budget_usd"):
             out.append(f"Budget:        ≈ ${plan['budget_usd']:.1f}/window ({plan['budget_source']})")
     else:
         out.append("No plan yet — run `primer refresh`.")
+    future_skips = sorted(d for d in skip if d >= datetime.fromtimestamp(now).date().isoformat())
+    if future_skips:
+        out.append("Days off:      " + ", ".join(future_skips))
     if timer_line:
         out.append(f"systemd:       {timer_line}")
     pings = db.execute("SELECT * FROM pings ORDER BY ts DESC LIMIT 6").fetchall()

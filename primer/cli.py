@@ -88,7 +88,8 @@ def cmd_ping(args, cfg):
         # past today, and fires late after resume from suspend. Only ping when a planned time was
         # within the last 15 minutes; anything else would open a window at a random moment.
         plan = _load_plan() or {}
-        planned = cloud.due(plan.get("schedule", {}), cloud.local_tz_name(), late_ok_min=15)
+        planned = cloud.due(plan.get("schedule", {}), cloud.local_tz_name(), late_ok_min=15,
+                            skip=set(cfg.get("skip_dates", [])))
         if planned is None:
             print("not due: no planned ping in the last 15 minutes")
             return 0
@@ -116,6 +117,30 @@ def cmd_cloud(args, cfg):
     elif args.action == "cron":
         plan = _load_plan() or {"schedule": {}}
         print(cloud.cron_for(plan["schedule"], cloud.local_tz_name()))
+    return 0
+
+
+def cmd_skip(args, cfg):
+    from datetime import date, timedelta
+    today = date.today()
+    skips = {d for d in cfg.get("skip_dates", []) if d >= today.isoformat()}  # forget past days
+    if args.clear:
+        skips = set()
+    for raw in args.dates:
+        try:
+            d = (today + timedelta(days=1)) if raw == "tomorrow" else today if raw == "today" else date.fromisoformat(raw)
+        except ValueError:
+            print(f"not a date: {raw} (use YYYY-MM-DD, today or tomorrow)", file=sys.stderr)
+            return 2
+        (skips.discard if args.remove else skips.add)(d.isoformat())
+    cfg["skip_dates"] = sorted(skips)
+    config.save(cfg)
+    print("Days off: " + (", ".join(cfg["skip_dates"]) or "none"))
+    plan = _load_plan()
+    if plan:
+        remote = cloud.sync(cfg, plan["schedule"])
+        if remote:
+            print(f"railway: {remote}")
     return 0
 
 
@@ -233,6 +258,10 @@ def main(argv=None):
     pg.add_argument("--force", action="store_true", help="ping even if a window is known to be open")
     pg.add_argument("--scheduled", action="store_true", help=argparse.SUPPRESS)
     sub.add_parser("statusline", help="Claude Code statusLine command (reads JSON on stdin)")
+    sk = sub.add_parser("skip", help="days with no pings (holidays): primer skip 2026-12-25 tomorrow")
+    sk.add_argument("dates", nargs="*")
+    sk.add_argument("--remove", action="store_true", help="un-skip the given dates")
+    sk.add_argument("--clear", action="store_true", help="remove all days off")
     cl = sub.add_parser("cloud", help="Railway runner: link, sync the plan, pull ping results")
     cl.add_argument("action", choices=["link", "sync", "pull", "cron"])
     cl.add_argument("--project")

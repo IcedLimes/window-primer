@@ -22,6 +22,13 @@ DEFAULTS = {
     "lookback_days": 35,
     # Recent weeks matter more: a day's weight halves every N days.
     "half_life_days": 21,
+    # Budget estimates fade faster: Anthropic changes limits every few months (promotions, the
+    # May 2026 doubling, the September 2026 cut), so an old limit hit says little about today.
+    "budget_half_life_days": 7,
+    # Work you were locked out of never reached the transcripts. Assume you'd have kept going at
+    # this fraction of your pre-lockout pace (for at most N hours) so the optimiser can see it.
+    "impute_lockout_factor": 0.5,
+    "impute_lockout_max_hours": 3,
     "window_hours": 5,
     # The API floors window starts to 10 minutes (observed in limit-hit messages and resetsAt).
     "bin_minutes": 10,
@@ -35,9 +42,12 @@ DEFAULTS = {
     "margin_weight": 0.2,
     # Per-window budget in API-equivalent USD. null = calibrate from limit hits / observations.
     "budget_override_usd": None,
-    # 'auto' cross-validates global vs per-weekday schedules (1 or 2 pings) and keeps the one that
-    # generalises best; 'global' or 'weekday' force a mode.
+    # 'auto' cross-validates global, pooled and per-weekday schedules (1 or 2 pings) and keeps the
+    # simplest one that generalises; 'global', 'pooled' or 'weekday' force a mode.
     "mode": "auto",
+    # Partial-pooling strength for mode 'pooled', in days: a weekday with n days of history is
+    # shrunk toward the all-days curve with weight κ/(n+κ).
+    "pool_kappa": 5.0,
     # Smooth the objective over ±N slots (10 min each) so a small shift in your start time doesn't
     # turn a good ping into a bad one.
     "smooth_slots": 3,
@@ -46,6 +56,8 @@ DEFAULTS = {
     "ping_timeout_s": 90,
     "ping_retries": 2,
     "claude_bin": None,
+    # Local dates (YYYY-MM-DD) with no pings, e.g. holidays. Managed with `primer skip`.
+    "skip_dates": [],
     # Railway cron runner: {"project": id, "environment": id, "service": id}; set by `primer cloud link`.
     "cloud": None,
 }

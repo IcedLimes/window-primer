@@ -50,12 +50,14 @@ def cron_for(schedule, tz_name):
     return f"{','.join(map(str, sorted(minutes)))} {','.join(map(str, sorted(hours)))} * * *"
 
 
-def due(schedule, tz_name, now=None, late_ok_min=LATE_OK_MIN):
+def due(schedule, tz_name, now=None, late_ok_min=LATE_OK_MIN, skip=()):
     """The planned local time this run is for, or None. Checks yesterday too for runs just past midnight."""
     tz = ZoneInfo(tz_name)
     now = now or datetime.now(tz)
     for back in (0, 1):
         day = (now - timedelta(days=back)).date()
+        if day.isoformat() in skip:
+            continue
         for t in schedule.get(WEEKDAYS[day.weekday()], []):
             h, m = map(int, t.split(":"))
             planned = datetime(day.year, day.month, day.day, h, m, tzinfo=tz)
@@ -69,7 +71,7 @@ def run():
     from . import ping
     payload = json.loads(os.environ.get("PRIMER_SCHEDULE") or "{}")
     schedule, tz_name = payload.get("schedule", {}), payload.get("tz", "UTC")
-    planned = due(schedule, tz_name)
+    planned = due(schedule, tz_name, skip=set(payload.get("skip_dates", [])))
     if os.environ.get("PRIMER_FORCE") == "1":
         planned = planned or datetime.now(ZoneInfo(tz_name))
     if planned is None:
@@ -126,7 +128,10 @@ def sync(cfg, schedule, sleep=time.sleep):
     if not t:
         return None
     tz_name = local_tz_name()
-    payload = json.dumps({"tz": tz_name, "model": cfg["ping_model"], "schedule": schedule}, sort_keys=True)
+    today = datetime.now().date().isoformat()
+    payload = json.dumps({"tz": tz_name, "model": cfg["ping_model"], "schedule": schedule,
+                          "skip_dates": sorted(d for d in cfg.get("skip_dates", []) if d >= today)},
+                         sort_keys=True)
     cron = cron_for(schedule, tz_name)
     state_path = config.DATA_DIR / "cloud_state.json"
     try:

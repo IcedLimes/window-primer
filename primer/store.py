@@ -39,6 +39,10 @@ CREATE TABLE IF NOT EXISTS pings (
     detail TEXT
 );
 
+CREATE TABLE IF NOT EXISTS resets_used (
+    ts REAL PRIMARY KEY           -- when /limit-reset was run (from transcripts)
+);
+
 CREATE TABLE IF NOT EXISTS files (
     path TEXT PRIMARY KEY,
     mtime REAL,
@@ -68,6 +72,11 @@ def add_observation(db, ts, source, five_util=None, five_resets_at=None, week_ut
     db.execute("INSERT INTO observations VALUES (?,?,?,?,?,?)", (ts, source, *row))
     db.commit()
     return True
+
+
+def last_reset_used(db):
+    row = db.execute("SELECT max(ts) FROM resets_used").fetchone()
+    return row[0] if row else None
 
 
 def latest_observation(db):

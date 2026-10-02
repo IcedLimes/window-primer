@@ -16,6 +16,7 @@ RESET_RE = re.compile(
     r"(?P<h>\d{1,2})(?::(?P<m>\d{2}))?\s*(?P<ap>[ap]m)\b(?:\s*\((?P<tz>[^)]+)\))?",
     re.IGNORECASE)
 LEGACY_RE = re.compile(r"usage limit reached\|(\d{9,11})", re.IGNORECASE)
+RESET_COMMAND = "<command-name>/limit-reset</command-name>"
 
 
 def parse_ts(s):
@@ -65,6 +66,18 @@ def ingest_file(db, path):
     events, hits = 0, 0
     with open(path, errors="ignore") as fh:
         for line in fh:
+            if RESET_COMMAND in line:
+                try:
+                    d = json.loads(line)
+                except ValueError:
+                    continue
+                # A real invocation is a user message whose string content *starts* with the tag;
+                # tool output that merely mentions it is a list of content blocks.
+                content = (d.get("message") or {}).get("content") if isinstance(d.get("message"), dict) else None
+                if (d.get("type") == "user" and d.get("timestamp") and isinstance(content, str)
+                        and content.lstrip().startswith(RESET_COMMAND)):
+                    db.execute("INSERT OR IGNORE INTO resets_used VALUES (?)", (parse_ts(d["timestamp"]),))
+                continue
             if '"assistant"' not in line:
                 continue
             try:
