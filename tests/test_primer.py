@@ -133,6 +133,31 @@ class Planner(unittest.TestCase):
         self.assertEqual(planner.weighted_quantile([(10, 1), (20, 1), (30, 2)], 0.5), 20)
 
 
+class DuplicateLimitHits(unittest.TestCase):
+    def test_duplicate_limit_messages_count_once(self):
+        db = store.connect(":memory:")
+        hit, reset = local_ts("2026-09-22 18:00"), local_ts("2026-09-22 19:40")
+        for offset in (0, 120, 300):  # one lockout, reported three times
+            db.execute("INSERT INTO limit_hits VALUES (?,?,?,?)", (hit + offset, reset, "session", ""))
+        hist = planner.load_history(db, CFG, local_ts("2026-09-25 12:00"))
+        self.assertEqual(len(hist.hits), 1)
+        db.close()
+
+
+class ScheduledPingGuard(unittest.TestCase):
+    def test_timer_firing_off_schedule_does_not_ping(self):
+        from primer import cli
+        import contextlib, io
+        config.PLAN_PATH.write_text(json.dumps({"schedule": {d: [] for d in planner.WEEKDAYS}}))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertEqual(cli.main(["ping", "--scheduled"]), 0)
+        self.assertIn("not due", out.getvalue())
+        db = store.connect()
+        self.assertEqual(db.execute("select count(*) from pings").fetchone()[0], 0)
+        db.close()
+
+
 class PingRun(unittest.TestCase):
     def setUp(self):
         self.db = store.connect(":memory:")

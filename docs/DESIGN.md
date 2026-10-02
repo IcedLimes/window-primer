@@ -103,8 +103,10 @@ floor lands on the intended slot.
 
 ## 4. Runtime
 
-- **primer-ping.timer** — one `OnCalendar=` line per planned ping, `AccuracySec=1s`, and
-  deliberately no `Persistent=`: a 07:01 ping missed while asleep must not fire at noon.
+- **primer-ping.timer** — one `OnCalendar=` line per planned ping, `AccuracySec=1s`, no
+  `Persistent=`. systemd still fires a timer late after resume from suspend, and immediately when
+  its schedule changes to include a time already past today, so the scheduled ping first checks
+  that a planned time was within the last 15 minutes and otherwise exits.
 - **primer ping** — skips if a live reading proves a window is already open; otherwise runs
   the ping (2 retries for networks that aren't up yet after resume) and logs whether it
   opened a window.

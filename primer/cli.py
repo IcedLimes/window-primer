@@ -83,6 +83,15 @@ def cmd_status(args, cfg):
 
 def cmd_ping(args, cfg):
     from . import ping
+    if args.scheduled:
+        # systemd fires a timer immediately when its schedule changes to include a time already
+        # past today, and fires late after resume from suspend. Only ping when a planned time was
+        # within the last 15 minutes; anything else would open a window at a random moment.
+        plan = _load_plan() or {}
+        planned = cloud.due(plan.get("schedule", {}), cloud.local_tz_name(), late_ok_min=15)
+        if planned is None:
+            print("not due: no planned ping in the last 15 minutes")
+            return 0
     db = store.connect()
     outcome, detail = ping.run(cfg, db, scheduled="timer" if args.scheduled else "manual", force=args.force)
     print(f"{outcome}: {detail}")

@@ -41,9 +41,14 @@ def load_history(db, cfg, now=None):
         b = to_bin(ts)
         demand[b] = demand.get(b, 0.0) + cost
 
-    hits = [(r["hit_ts"], r["reset_ts"]) for r in db.execute(
-        "SELECT hit_ts, reset_ts FROM limit_hits WHERE kind='session' AND hit_ts BETWEEN ? AND ? "
-        "ORDER BY hit_ts", (since, now))]
+    # Claude Code can print the limit message several times for one lockout; keep the first per window.
+    hits, seen = [], set()
+    for r in db.execute("SELECT hit_ts, reset_ts FROM limit_hits WHERE kind='session' AND hit_ts BETWEEN ? AND ? "
+                        "ORDER BY hit_ts", (since, now)):
+        key = to_bin(r["reset_ts"]) if r["reset_ts"] else r["hit_ts"]
+        if key not in seen:
+            seen.add(key)
+            hits.append((r["hit_ts"], r["reset_ts"]))
     # Windows we know started (from limit hits / live observations) but with no Claude Code
     # activity at that moment were opened elsewhere (claude.ai, phone). Replay them as zero-cost activity.
     starts = {to_bin(r - wsec) for _, r in hits if r}
