@@ -42,6 +42,12 @@ DEFAULTS = {
     "margin_weight": 0.2,
     # Per-window budget in API-equivalent USD. null = calibrate from limit hits / observations.
     "budget_override_usd": None,
+    # Only calibrate from data after this local time ("2026-10-01T21:30"), e.g. after a plan change.
+    # Plan changes that reset the weekly counter are detected automatically; this covers the rest.
+    "budget_since": None,
+    # You stop before the limit to avoid being cut off mid-response; plan as if the budget were this
+    # fraction of the real one. Windows you left at this level count as (soft) lockouts.
+    "stop_at": 0.95,
     # 'auto' cross-validates global, pooled and per-weekday schedules (1 or 2 pings) and keeps the
     # simplest one that generalises; 'global', 'pooled' or 'weekday' force a mode.
     "mode": "auto",

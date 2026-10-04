@@ -65,8 +65,8 @@ In Claude Code: `/primer:status`, `/primer:report`, `/primer:replan`, `/primer:p
 "when does my limit reset?".
 
 Useful settings: `ping_hours` (only ping inside these local hours), `max_pings_per_day`,
-`mode` (`auto` | `global` | `pooled` | `weekday`), `pool_kappa`, `budget_override_usd`,
-`lookback_days`, `impute_lockout_factor`.
+`mode` (`auto` | `global` | `pooled` | `weekday`), `pool_kappa`, `stop_at`, `budget_since`,
+`budget_override_usd`, `lookback_days`, `impute_lockout_factor`.
 
 When your window is nearly spent with a long wait left, the statusline and `primer status`
 point out how much a `/limit-reset` would save — but only if the weekly limit has room and you
@@ -88,6 +88,23 @@ haven't used one in the past week, since it's rationed.
 5. Once pings run, the report compares real limit hits and lockout time before vs since.
 
 Details and the evidence behind each choice: [docs/DESIGN.md](docs/DESIGN.md).
+
+## FAQ
+
+**Does it only learn from the times I hit the limit?** No. It replays *all* your usage, response by
+response. Limit hits and live statusline readings are only used to measure how big a window is. If you
+stop before the limit, `stop_at` (default 0.95) makes it plan against the budget you actually use, and
+windows you left early near the limit are treated as lockouts. Recent Claude Code also waits at the
+limit and continues by itself after the reset, so stopping early matters less than it used to.
+
+**Why not just ping at the start of every 5-hour window?** It was tested on real history: it tied the
+optimized schedule at best, cost ~5 pings a day instead of ~1, and was worse than no pings on about 1
+day in 11. Its reset times drift an hour later every day, so they can't follow your routine. The report
+shows how it would have done on your own data, every time.
+
+**I upgraded my plan — will it notice?** Yes: an upgrade, downgrade or weekly reset shows up in the
+live readings, and the budget is re-estimated from data after it. If a change slips through, run
+`primer config budget_since 2026-10-01T21:30`.
 
 ## Cloud runner (Railway)
 

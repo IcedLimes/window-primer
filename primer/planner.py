@@ -5,6 +5,7 @@ from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
+from . import readings
 from .sim import BIN, bin_local, crossing_bin, simulate, to_bin
 
 WEEKDAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"]
@@ -22,6 +23,14 @@ class History:
     hits: list = field(default_factory=list)  # [(hit_ts, reset_ts)] session limit hits
     raw: tuple = None         # (bins, costs) actually observed; calibration must not see imputed demand
     imputed: float = 0.0
+    live: list = field(default_factory=list)     # windows seen in live readings
+    changes: list = field(default_factory=list)  # plan / limit changes (epoch s); each starts a window
+    soft: list = field(default_factory=list)     # windows left early near the limit
+    soft_imputed: float = 0.0
+
+    @property
+    def forced(self):
+        return [to_bin(c) for c in self.changes]
 
     def cost_between(self, t0, t1):
         bins, costs = self.raw or (self.act_bins, self.act_costs)
@@ -32,7 +41,8 @@ class History:
         """Copy with activity in bins [b0, b1) removed (for cross-validation)."""
         keep = [(b, c) for b, c in zip(self.act_bins, self.act_costs) if not b0 <= b < b1]
         return History([b for b, _ in keep], [c for _, c in keep], self.first_day, self.last_day,
-                       self.now, self.externals, self.hits, self.raw, self.imputed)
+                       self.now, self.externals, self.hits, self.raw, self.imputed, self.live,
+                       self.changes, self.soft, self.soft_imputed)
 
 
 def load_history(db, cfg, now=None):
@@ -52,11 +62,14 @@ def load_history(db, cfg, now=None):
         if key not in seen:
             seen.add(key)
             hits.append((r["hit_ts"], r["reset_ts"]))
+    live = readings.live_windows(db, wsec)
+    changes = readings.limit_changes(db, live)
+    if cfg.get("budget_since"):
+        changes = sorted(set(changes) | {_parse_local(cfg["budget_since"])})
+    changes = [c for c in changes if since <= c <= now]
     # Windows we know started (from limit hits / live observations) but with no Claude Code
     # activity at that moment were opened elsewhere (claude.ai, phone). Replay them as zero-cost activity.
-    starts = {to_bin(r - wsec) for _, r in hits if r}
-    starts |= {to_bin(r[0] - wsec) for r in db.execute(
-        "SELECT DISTINCT five_resets_at FROM observations WHERE five_resets_at IS NOT NULL")}
+    starts = {to_bin(r - wsec) for _, r in hits if r} | {to_bin(w["start"]) for w in live}
     externals = []
     for s in sorted(starts):
         if to_bin(since) <= s <= to_bin(now) and s not in demand:
@@ -68,7 +81,30 @@ def load_history(db, cfg, now=None):
     imputed = impute_lockouts(demand, hits, cfg, now)
     bins = sorted(demand)
     return History(bins, [demand[b] for b in bins], datetime.fromtimestamp(since).date(),
-                   datetime.fromtimestamp(now).date(), now, externals, hits, raw, imputed)
+                   datetime.fromtimestamp(now).date(), now, externals, hits, raw, imputed, live, changes)
+
+
+def _parse_local(value):
+    if isinstance(value, (int, float)):
+        return float(value)
+    return datetime.fromisoformat(str(value)).timestamp()
+
+
+def apply_soft_lockouts(hist, budget, cfg):
+    """Find windows left early near the limit (see readings.soft_lockouts) and fill in the work they
+    displaced, so the optimiser sees them as the lockouts they effectively were."""
+    wsec = cfg["window_hours"] * 3600
+    # Replay without pings, pinning every window start we know for sure.
+    known = set(hist.forced) | {to_bin(r - wsec) for _, r in hist.hits if r} | {to_bin(w["start"]) for w in hist.live}
+    bins, costs = hist.raw
+    windows = simulate(bins, costs, [], int(wsec // BIN), detail=True, forced=sorted(known))
+    events = readings.soft_lockouts(hist, hist.live, windows, budget.at, cfg["stop_at"])
+    demand = dict(zip(hist.act_bins, hist.act_costs))
+    added = readings.impute_soft(demand, events, cfg, to_bin(hist.now))
+    hist.act_bins = sorted(demand)
+    hist.act_costs = [demand[b] for b in hist.act_bins]
+    hist.soft, hist.soft_imputed = events, added
+    return events
 
 
 def impute_lockouts(demand, hits, cfg, now):
@@ -100,10 +136,28 @@ class Budget:
     dist: list = field(default_factory=list)  # [(value, probability)]; empty = unknown
     source: str = ""
     estimates: list = field(default_factory=list)
+    since: float = None                         # estimates before this (a plan change) are ignored
+    periods: list = field(default_factory=list)  # [(from_ts, budget)] for each limit period
+
+    def at(self, ts):
+        """Budget in force at ts (older periods matter when judging old windows)."""
+        value = self.point
+        for start, b in self.periods:
+            if ts >= start and b:
+                value = b
+        return value
+
+    def scaled(self, factor):
+        """The budget you actually plan against when you stop at `factor` of the real limit."""
+        if not self.dist:
+            return self
+        return Budget(self.point * factor, [(b * factor, p) for b, p in self.dist], self.source,
+                      self.estimates, self.since, [(t, b * factor) for t, b in self.periods])
 
 
 def calibrate(db, hist, cfg):
-    """Estimate the budget from limit hits and live utilization readings."""
+    """Estimate the budget from limit hits and live utilization readings, using only data since the
+    latest plan or limit change (older periods are kept separately for judging old windows)."""
     if cfg.get("budget_override_usd"):
         b = float(cfg["budget_override_usd"])
         return Budget(b, [(b, 1.0)], "config override")
@@ -114,14 +168,7 @@ def calibrate(db, hist, cfg):
             load = hist.cost_between(reset_ts - wsec, hit_ts)
             if load > 0:
                 estimates.append({"source": "limit hit", "ts": hit_ts, "budget": load})
-    # One reading per window: the latest (highest-utilization) one.
-    for r in db.execute(
-            "SELECT five_resets_at, max(five_util) AS util, max(ts) AS ts FROM observations "
-            "WHERE five_util >= 0.15 AND ts >= ? GROUP BY five_resets_at",
-            (hist.now - cfg["lookback_days"] * 86400,)):
-        load = hist.cost_between(r["five_resets_at"] - wsec, r["ts"])
-        if load > 0:
-            estimates.append({"source": "utilization", "ts": r["ts"], "budget": load / r["util"]})
+    estimates += readings.budget_estimates(db, hist, hist.live, wsec)
     if not estimates:
         return Budget(source="uncalibrated (no limit hits or utilization readings yet)")
     # Limits and model mix drift, so recent estimates count more; utilization readings know the exact
@@ -130,7 +177,20 @@ def calibrate(db, hist, cfg):
     hl = cfg["budget_half_life_days"] * 86400
     for e in estimates:
         e["weight"] = 0.5 ** (max(hist.now - e["ts"], 0) / hl) * (2 if e["source"] == "utilization" else 1)
-    pairs = [(e["budget"], e["weight"]) for e in estimates]
+    bounds = [None] + sorted(hist.changes)
+    periods = []
+    for i, start in enumerate(bounds):
+        end = bounds[i + 1] if i + 1 < len(bounds) else float("inf")
+        group = [(e["budget"], e["weight"]) for e in estimates if (start is None or e["ts"] >= start) and e["ts"] < end]
+        periods.append((start if start is not None else float("-inf"), weighted_quantile(group, 0.5) if group else None))
+    since = hist.changes[-1] if hist.changes else None
+    current = [e for e in estimates if since is None or e["ts"] >= since]
+    note = ""
+    if since is not None:
+        note = f", since the limit change on {datetime.fromtimestamp(since):%a %m-%d %H:%M}"
+        if not current:
+            current, note = estimates, note + " (no readings since it yet; using older ones)"
+    pairs = [(e["budget"], e["weight"]) for e in current]
     total = sum(w for _, w in pairs)
     if len(pairs) > 12:
         dist = [(weighted_quantile(pairs, (i + 0.5) / 12), 1 / 12) for i in range(12)]
@@ -138,8 +198,11 @@ def calibrate(db, hist, cfg):
         dist = [(v, w / total) for v, w in pairs]
     lo, hi = min(v for v, _ in pairs), max(v for v, _ in pairs)
     spread = f", range ${lo:.0f}–${hi:.0f}" if hi > lo * 1.25 else ""
-    return Budget(weighted_quantile(pairs, 0.5), dist,
-                  f"recency-weighted median of {len(estimates)} estimate(s){spread}", estimates)
+    point = weighted_quantile(pairs, 0.5)
+    for e in estimates:
+        e["current"] = since is None or e["ts"] >= since
+    return Budget(point, dist, f"recency-weighted median of {len(current)} estimate(s){spread}{note}",
+                  estimates, since, [(t, b if b else point) for t, b in periods])
 
 
 def weighted_quantile(pairs, q):
@@ -211,8 +274,12 @@ class Scorer:
             wd = self._wd[b] = bin_local(b).weekday()
         return wd
 
-    def windows(self, schedule, detail=False):
-        return simulate(self.hist.act_bins, self.hist.act_costs, self.ping_bins(schedule), self.wbins, detail)
+    def windows(self, schedule, detail=False, keepalive_from=None):
+        pings = self.ping_bins(schedule)
+        if keepalive_from is not None:
+            pings = sorted(pings + [keepalive_from])
+        return simulate(self.hist.act_bins, self.hist.act_costs, pings, self.wbins, detail,
+                        forced=self.hist.forced, keepalive=keepalive_from is not None)
 
     def window_score(self, w):
         return self.score([w])
@@ -377,10 +444,11 @@ def optimize(hist, budget, cfg, weighted=True):
     return schedule
 
 
-def backtest(hist, budget, cfg, schedule, select=None):
-    """Unweighted replay of history under a schedule."""
+def backtest(hist, budget, cfg, schedule, select=None, keepalive_from=None):
+    """Unweighted replay of history under a schedule (or keep-alive pings from a first ping)."""
     sc = Scorer(hist, budget, cfg, weighted=False)
-    wins = [w for w in sc.windows(schedule, detail=True) if select is None or select(w)]
+    wins = [w for w in sc.windows(schedule, detail=True, keepalive_from=keepalive_from)
+            if select is None or select(w)]
     out = {"windows": len(wins), "peak_load": max((w.load for w in wins), default=0.0),
            "ping_opened": sum(w.by_ping for w in wins)}
     budget = budget.point
@@ -460,9 +528,42 @@ def weekday_profile(hist, cfg, per_hour=2):
     return [[v / norm[wd] if norm[wd] else 0.0 for v in row] for wd, row in enumerate(grid)], count
 
 
+def keepalive_compare(hist, budget, cfg):
+    """A ping at every window start (windows back to back, 24/7). Its reset times drift an hour a day
+    (24 h isn't a multiple of 5 h), so its result depends on where the chain started: try all 30
+    ten-minute starting points. Nothing is tuned, so in-sample is also out-of-sample."""
+    if not budget.point or not hist.act_bins:
+        return None
+    first = to_bin(datetime.combine(hist.first_day, datetime.min.time()).timestamp())
+    runs = []
+    none = {wd: [] for wd in range(7)}
+    for phase in range(int(cfg["window_hours"] * 3600 // BIN)):
+        r = backtest(hist, budget, cfg, none, keepalive_from=first + phase)
+        runs.append(r)
+    lock = sorted(r["lockout_min"] for r in runs)
+    # A chain sends a ping at every reset, used or not: 24 / 5 a day.
+    return {"lockout_mean": sum(lock) / len(lock), "lockout_min": lock[0], "lockout_max": lock[-1],
+            "hits_mean": sum(r["hits"] for r in runs) / len(runs),
+            "pings_per_day": 24 / cfg["window_hours"],
+            "aligned_by_change": bool(hist.changes) and lock[0] == lock[-1]}
+
+
+def _period_check(hist, budget, cfg):
+    """Replay vs reality within the current limit period: predicted vs actual limit hits."""
+    since = hist.changes[-1] if hist.changes else None
+    none = {wd: [] for wd in range(7)}
+    predicted = backtest(hist, budget, cfg, none, lambda w: since is None or w.start * BIN >= since).get("hits", 0)
+    actual = sum(1 for h, _ in hist.hits if since is None or h >= since)
+    return {"since": since, "predicted": predicted, "actual": actual}
+
+
 def plan(db, cfg, now=None):
     hist = load_history(db, cfg, now)
-    budget = calibrate(db, hist, cfg)
+    real_budget = calibrate(db, hist, cfg)
+    if real_budget.point:
+        apply_soft_lockouts(hist, real_budget, cfg)
+    # You stop short of the limit, so plan against the budget you actually use.
+    budget = real_budget.scaled(cfg["stop_at"])
     none = {wd: [] for wd in range(7)}
     if cfg["mode"] == "auto":
         variant, cv_rows = choose_variant(hist, budget, cfg)
@@ -482,9 +583,15 @@ def plan(db, cfg, now=None):
         "active_bins": len(hist.act_bins) - len(hist.externals),
         "external_starts": len(hist.externals),
         "limit_hits": len(hist.hits),
-        "budget_usd": budget.point,
-        "budget_source": budget.source,
-        "budget_estimates": budget.estimates,
+        "budget_usd": real_budget.point,
+        "budget_source": real_budget.source,
+        "budget_estimates": real_budget.estimates,
+        "stop_at": cfg["stop_at"],
+        "limit_changes": hist.changes,
+        "soft_lockouts": hist.soft,
+        "soft_imputed_usd": hist.soft_imputed,
+        "keepalive": keepalive_compare(hist, budget, cfg),
+        "period_check": _period_check(hist, budget, cfg),
         "reason": reason,
         "schedule": {WEEKDAYS[wd]: [slot_label(s, cfg["bin_minutes"]) for s in slots]
                      for wd, slots in schedule.items()},
@@ -533,13 +640,24 @@ def reset_advice(five_util, five_resets_at, week_util, last_reset_ts, now, min_s
 
 
 def real_world(db, hist):
-    """Actual limit hits and lockout time before vs since scheduled pings began."""
-    row = db.execute("SELECT min(ts) FROM pings WHERE scheduled IN ('timer', 'cloud') "
-                     "AND outcome IN ('opened', 'inside-window')").fetchone()
+    """Actual limit hits and lockout time before vs since scheduled pings started opening windows,
+    within one plan/limit period (an upgrade in between would swamp any effect of the pings)."""
+    row = db.execute("SELECT min(ts) FROM pings WHERE scheduled IN ('timer', 'cloud') AND outcome = 'opened'").fetchone()
     start = row[0] if row else None
     out = {"pings_started": start}
     if not start:
         return out
+    period = max([datetime.combine(hist.first_day, datetime.min.time()).timestamp()]
+                 + [c for c in hist.changes if c <= start])
+    end = min([hist.now] + [c for c in hist.changes if c > start])
+    for name, t0, t1 in (("before", period, start), ("since", start, end)):
+        hits = [(h, r) for h, r in hist.hits if t0 <= h < t1 and r]
+        days = max((t1 - t0) / 86400, 1e-9)
+        out[name] = {"days": days, "hits": len(hits), "hits_per_week": len(hits) / days * 7,
+                     "lockout_min_per_week": sum((r - h) / 60 for h, r in hits) / days * 7}
+    out["opened"] = db.execute("SELECT count(*) FROM pings WHERE scheduled IN ('timer', 'cloud') "
+                               "AND outcome = 'opened'").fetchone()[0]
+    return out
     since = datetime.combine(hist.first_day, datetime.min.time()).timestamp()
     for name, t0, t1 in (("before", since, start), ("since", start, hist.now)):
         hits = [(h, r) for h, r in hist.hits if t0 <= h < t1 and r]

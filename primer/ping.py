@@ -59,7 +59,8 @@ def windows_from_info(info):
 def active_window_until(db, now):
     """Reset time of a window we *know* is open (from a live reading), else None.
     Only hard evidence counts: wrongly skipping a ping costs far more than a redundant one."""
-    row = db.execute("SELECT max(five_resets_at) FROM observations").fetchone()
+    # Off-grid values are glitches (real window boundaries are multiples of 10 minutes).
+    row = db.execute("SELECT max(five_resets_at) FROM observations WHERE CAST(five_resets_at AS INTEGER) % 600 = 0").fetchone()
     if row and row[0] and row[0] > now + 60:
         return row[0]
     return None

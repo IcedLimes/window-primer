@@ -86,6 +86,29 @@ recency-weighted distribution of estimates** (readings count double, half-life 7
 than the 21-day half-life for usage patterns, because limits change faster than habits). The
 median is shown for display and replay.
 
+**Plan and limit changes.** A plan upgrade changed this user's budget about 4x overnight, and
+averaging old and new estimates gave a number wrong for both. A change shows up in live readings as
+the weekly counter dropping by 20+ points while its scheduled reset stays put (an upgrade, downgrade
+or weekly reset); a new window also starts at that moment. Calibration then uses only estimates since
+the latest change (`budget_since` sets one by hand), older windows are judged against their own
+period's budget, and the replay forces a window boundary at the change.
+
+**Stale readings.** Every open Claude Code session feeds the statusline, and an idle one keeps
+re-printing its last-known values every 60 s — 97% of this user's readings were such repeats. Only the
+first appearance of a value counts; utilization estimates use the moment the window's highest value
+was *first* reported, and off-grid reset times (real ones are multiples of 10 minutes) are dropped.
+
+**Stopping early.** People stop before the limit so they aren't cut off mid-response, so hard limit
+hits under-count the moments a reset was needed. Plans use an effective budget of `stop_at` × the
+budget (default 0.95), and a window counts as a *soft lockout* when you left it 20+ minutes before its
+end with utilization ≥ `stop_at` (from live readings), or — for older windows without readings — with
+load ≥ `stop_at` × that period's budget *and* activity resuming within 30 minutes after the reset
+(without that test a late-night stop is indistinguishable from bedtime). Soft lockouts get the same
+blocked-work estimate as hard ones. On this user's 5.7 weeks none were found, three ways (strict rule
+at several thresholds and budgets, return-right-after-reset rate, stop hazard at high load); the rule is
+there to catch it as statusline data accumulates. Interactive Claude Code (v2.1.234+) also waits at the
+limit and continues the task by itself after the reset, which takes away much of the reason to stop early.
+
 **Blocked work.** During a real lockout the transcripts show nothing, which would teach the
 optimiser that those hours don't matter — exactly the hours a better ping would rescue. So
 each lockout is filled at half the pace of the 70 minutes before the hit (for at most 3 h,
@@ -114,6 +137,17 @@ examples per decision and overfit badly; in testing they made held-out weeks *wo
 if it beats not pinging by `min_gain_frac`. Otherwise nothing is scheduled. With five weeks of
 history the ranking has consistently been global > pooled > per-weekday; pooling is there to
 take over as history grows.
+
+**Why not ping at the start of every window?** A keep-alive chain (ping whenever a window ends, so
+windows tile time and a reset is always under 5 hours away) was simulated on this user's history
+against no pings and the cross-validated schedule, across budgets and `stop_at` values, with all 30
+possible chain phases and leave-one-week-out validation. It never clearly won: on held-out weeks it
+tied the scheduled pings (+48 min of lockout over 35 days, 95% interval −172 to +282), needed ~4.8
+pings a day instead of ~1, and was worse than no pings on about 9% of days — a boundary can also land
+where it concentrates a heavy stretch into one window. Because 24 h isn't a multiple of 5 h, its reset
+times drift an hour later each day and can't be aimed at a routine; its result swung by 90–145 min
+depending on the phase. The report keeps scoring it (`Ping at every window start instead…`) so the
+evidence stays visible as habits or limits change.
 
 **Spending `/limit-reset` well.** The statusline and `primer status` suggest the reset only
 when it buys a lot: the window is ≥ 90 % used with ≥ 45 min left, the weekly limit is under

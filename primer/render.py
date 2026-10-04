@@ -61,8 +61,19 @@ def report(result, hist, cfg):
     if budget:
         out.append(f"Budget  ≈ ${budget:.1f} API-equivalent per {cfg['window_hours']}h window "
                    f"[{result['budget_source']}]")
+        for c in result.get("limit_changes") or []:
+            out.append(f"         plan/limit change detected {_when(c)} — older estimates (·) don't count")
         for e in sorted(result["budget_estimates"], key=lambda e: e["ts"]):
-            out.append(f"         {e['source']:<12} {_when(e['ts'])}  ${e['budget']:.1f}")
+            mark = " " if e.get("current", True) else "·"
+            out.append(f"       {mark} {e['source']:<12} {_when(e['ts'])}  ${e['budget']:.1f}")
+        stop_at = result.get("stop_at", 1.0)
+        soft = result.get("soft_lockouts") or []
+        out.append(f"        You stop at ~{stop_at:.0%} of the limit (stop_at), so plans use ${budget * stop_at:.0f}. "
+                   f"Windows left early near the limit: {len(soft)}"
+                   + ("" if soft else " (none detected — set `primer config stop_at` lower if you stop earlier)"))
+        for e in soft:
+            out.append(f"         early stop {_when(e['start'] * 600)}: at {e['util']:.0%}, stopped "
+                       f"{_dur((e['end'] - e['stop'] - 1) * 10)} before the reset ({e['source']})")
     else:
         out.append(f"Budget  unknown — {result['budget_source']}; planning to balance load across windows")
     out.append("")
@@ -73,12 +84,12 @@ def report(result, hist, cfg):
     out.append(f"Replay of the last {cfg['lookback_days']} days     no pings   with plan")
     for name, a, b in _bt_rows(result["baseline"], result["planned"], budget):
         out.append(f"  {name:<28} {str(a):>9}   {str(b):>9}")
-    if budget:
-        predicted = result["baseline"]["hits"]
-        out.append(f"  Sanity check: at ${budget:.0f} the replay predicts {predicted} limit hit(s); "
-                   f"you actually had {result['limit_hits']}."
-                   + ("  Big gap → the limit has probably changed; fresh statusline readings will settle it."
-                      if abs(predicted - result["limit_hits"]) > max(2, result["limit_hits"] / 2) else ""))
+    pc = result.get("period_check")
+    if budget and pc:
+        where = f"since {_when(pc['since'])}" if pc["since"] else "over the whole history"
+        out.append(f"  Sanity check {where}: the replay predicts {pc['predicted']} limit hit(s); you had {pc['actual']}."
+                   + ("  Big gap → the budget estimate is off; fresh statusline readings will settle it."
+                      if abs(pc["predicted"] - pc["actual"]) > max(2, pc["actual"] / 2) else ""))
     out.append("")
     out.append("Held-out weeks (plan without that week, test on it) — what to actually expect:")
     for r in result["cv"]:
@@ -88,6 +99,17 @@ def report(result, hist, cfg):
                        f"   over-budget windows {b['hits']} → {p['hits']}")
         else:
             out.append(f"  {r['mode']:<7} ≤{r['pings']} ping/day   Σload² {b['sum_sq']:.0f} → {p['sum_sq']:.0f}")
+    ka = result.get("keepalive")
+    if ka:
+        cv_best = min((r["planned"].get("lockout_min", 0) for r in result["cv"]), default=None)
+        out.append("")
+        out.append(f"Ping at every window start instead (keep-alive, {ka['pings_per_day']:.1f} pings/day): lockout "
+                   f"{_dur(ka['lockout_mean'])} (range {_dur(ka['lockout_min'])}–{_dur(ka['lockout_max'])} depending "
+                   f"on where the chain starts) vs {_dur(result['baseline'].get('lockout_min', 0))} with no pings"
+                   + (f" and {_dur(cv_best)} for the plan on held-out weeks." if cv_best is not None else "."))
+        if ka.get("aligned_by_change"):
+            out.append("  (Every starting point gives the same result: the plan change re-anchored the chain, and "
+                       "all lockouts since came after it.)")
     rw = result.get("real_world") or {}
     out.append("")
     if rw.get("since") and rw["since"]["days"] >= 1:
@@ -96,9 +118,10 @@ def report(result, hist, cfg):
         out.append(f"  limit hits per week        {b['hits_per_week']:9.1f}   {a['hits_per_week']:9.1f}")
         out.append(f"  lockout per week           {_dur(b['lockout_min_per_week']):>9}   {_dur(a['lockout_min_per_week']):>9}")
     else:
-        out.append("Real world: no scheduled pings yet — this section compares before vs after once they start.")
-    if result.get("imputed_usd"):
-        out.append(f"(Replay includes ${result['imputed_usd']:.0f} of estimated work blocked by past lockouts.)")
+        out.append("Real world: no scheduled ping has opened a window yet — this compares before vs after once one does.")
+    blocked = (result.get("imputed_usd") or 0) + (result.get("soft_imputed_usd") or 0)
+    if blocked:
+        out.append(f"(Replay includes ${blocked:.0f} of estimated work blocked by past lockouts.)")
     out.append("\nCaveats: claude.ai/phone usage is only visible through limit hits and live readings; work blocked "
                "by past lockouts is estimated (impute_lockout_factor), not observed.")
     return "\n".join(out)
