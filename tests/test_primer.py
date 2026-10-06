@@ -547,7 +547,7 @@ class Backends(unittest.TestCase):
         import plistlib
         from primer.backends import launchd
         job = plistlib.loads(launchd.ping_plist(self.SCHED))
-        self.assertEqual(job["ProgramArguments"][:2], [sys.executable, str(system.ENTRY)])
+        self.assertEqual(job["ProgramArguments"][:2], [str(system.python()), str(system.ENTRY)])
         self.assertEqual(job["ProgramArguments"][2:], ["ping", "--scheduled"])
         self.assertIn({"Weekday": 1, "Hour": 10, "Minute": 51}, job["StartCalendarInterval"])  # Monday
         self.assertIn({"Weekday": 0, "Hour": 17, "Minute": 31}, job["StartCalendarInterval"])  # Sunday
@@ -581,7 +581,7 @@ class Backends(unittest.TestCase):
         line = next(l for l in unit.splitlines() if l.startswith("ExecStart="))
         self.assertIn(str(system.ENTRY), line)
         self.assertTrue(line.endswith("ping --scheduled"))
-        self.assertIn(sys.executable, line)
+        self.assertIn(str(system.python()), line)  # the pinned interpreter (stable python3 name if it's the same binary)
 
     def test_launchd_reloads_only_on_change(self):
         from primer.backends import launchd
