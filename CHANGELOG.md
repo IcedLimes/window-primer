@@ -1,6 +1,8 @@
 # Changelog
 
-## Unreleased
+## 1.1.0 — 2026-10-05
+
+Linux, macOS and Windows.
 
 - macOS (launchd) and Windows (Task Scheduler) support; one Python entry point
   (`bin/primer.py`) run with a pinned interpreter everywhere.
