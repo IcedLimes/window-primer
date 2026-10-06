@@ -9,27 +9,18 @@ time zone — whether a ping is due right now. Planned times sit 1 minute into a
 
 import json
 import os
-import shutil
 import subprocess
 import sys
 import time
 from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
-from . import config
+from . import config, system
 from .planner import WEEKDAYS
 
 LATE_OK_MIN = 30  # a late ping still helps; much later and it's a different plan
 
 
-def local_tz_name():
-    tz = os.environ.get("TZ")
-    if tz:
-        return tz
-    try:
-        return os.readlink("/etc/localtime").split("zoneinfo/", 1)[1]
-    except (OSError, IndexError):
-        return "UTC"
+local_tz_name = system.local_tz_name
 
 
 def cron_for(schedule, tz_name):
@@ -37,9 +28,11 @@ def cron_for(schedule, tz_name):
     times = {t for ts in schedule.values() for t in ts}
     if not times:
         return None
-    tz = ZoneInfo(tz_name)
+    tz = system.zone(tz_name)
     year = datetime.now().year
-    offsets = {datetime(year, m, 15, 12, tzinfo=tz).utcoffset() for m in (1, 7)}
+    # Without a tz database (stock Windows Python) the OS clock still knows local DST.
+    offsets = ({datetime(year, m, 15, 12, tzinfo=tz).utcoffset() for m in (1, 7)} if tz
+               else system.local_utc_offsets(year))
     minutes, hours = set(), set()
     for t in times:
         h, m = map(int, t.split(":"))
@@ -52,8 +45,10 @@ def cron_for(schedule, tz_name):
 
 def due(schedule, tz_name, now=None, late_ok_min=LATE_OK_MIN, skip=()):
     """The planned local time this run is for, or None. Checks yesterday too for runs just past midnight."""
-    tz = ZoneInfo(tz_name)
+    tz = system.zone(tz_name)  # None → naive local time (tz_name is this machine's zone)
     now = now or datetime.now(tz)
+    if tz is None and now.tzinfo is not None:
+        now = now.astimezone().replace(tzinfo=None)
     for back in (0, 1):
         day = (now - timedelta(days=back)).date()
         if day.isoformat() in skip:
@@ -73,7 +68,7 @@ def run():
     schedule, tz_name = payload.get("schedule", {}), payload.get("tz", "UTC")
     planned = due(schedule, tz_name, skip=set(payload.get("skip_dates", [])))
     if os.environ.get("PRIMER_FORCE") == "1":
-        planned = planned or datetime.now(ZoneInfo(tz_name))
+        planned = planned or datetime.now(system.zone(tz_name))
     if planned is None:
         print(json.dumps({"primer": "not-due", "at": time.time()}), flush=True)
         return 0
@@ -109,7 +104,9 @@ def run():
 # ---- local side: push the plan to Railway and pull ping results back ----
 
 def _railway(*args, timeout=60):
-    exe = shutil.which("railway") or os.path.expanduser("~/.npm-global/bin/railway")
+    exe = system.find_program("railway", system.program_candidates("railway"))
+    if not exe:
+        raise OSError("railway CLI not found")
     return subprocess.run([exe, *args], capture_output=True, text=True, timeout=timeout)
 
 

@@ -44,14 +44,15 @@ window-primer/                     ← repo == Claude Code plugin root
     planner.py    calibration, optimisation, backtest, cross-validation
     render.py     terminal heatmap / report / status
     ping.py       run the ping, parse rate_limit_event, log it
-    scheduler.py  systemd user units (ping timer + daily replan timer)
     statusline.py statusline: records live window state, prints a status line
     cloud.py      Railway cron runner + local sync of schedule and results
+    system.py     OS differences: paths, interpreter, launchers, locking, time zones
+    scheduler.py  picks a backend: backends/systemd.py, launchd.py, taskscheduler.py
+    winzones.py   Windows → IANA time-zone names (CLDR)
     cli.py        subcommands
   cloud/Dockerfile                 image for the cloud runner
   tests/                           unittest suite
-~/.local/share/window-primer/      primer.db, config.json, plan.json
-~/.config/systemd/user/            primer-ping.{service,timer}, primer-replan.{service,timer}
+<data dir>/                        primer.db, config.json, plan.json  (per-OS location, see README)
 ```
 
 ```
@@ -180,7 +181,35 @@ limit hits and lockout time per week before vs since, which is the only test tha
 are memoised per schedule, ping times come from precomputed local midnights, and windows that
 sit below every budget skip the per-budget sum; a full plan takes under 10 s.
 
-## 5. Cloud runner
+## 5. Platforms
+
+`primer/system.py` holds everything OS-specific; `primer/scheduler.py` picks a backend.
+
+| | Scheduler | Missed while asleep | Notes |
+|---|---|---|---|
+| Linux | systemd user timers (`primer-ping.timer`, `primer-replan.timer`) | ping: fires late on resume → refused by the due check; replan: `Persistent=true` | `loginctl enable-linger` keeps them running while logged out |
+| macOS | launchd LaunchAgents (`io.github.icedlimes.window-primer.*`) | both run once on wake → ping refused by the due check | launchd's PATH is bare, so the install-time PATH is copied into the job |
+| Windows | Task Scheduler (`\window-primer\ping`, `\window-primer\replan`) | ping: `StartWhenAvailable=false`; replan: `true` | runs as you while logged on, via `pythonw.exe`; optional `WakeToRun` |
+
+Shared choices:
+
+- **One entry point, pinned interpreter.** Jobs, the statusline and the `primer` launchers run
+  `<python> bin/primer.py …` with the interpreter `primer install` ran under — never whatever
+  `python3` is first on a job's PATH (macOS ships 3.9; Windows may hit the Store alias). The
+  stable `python3` name is pinned when it points at the same interpreter, so a distro or
+  Homebrew upgrade from 3.14 to 3.15 doesn't strand the jobs.
+- **Real executables, not npm wrappers.** On Windows, npm installs `claude.cmd` / `railway.cmd`;
+  the ping's empty `--tools ""` and the JSON passed to Railway don't survive cmd.exe, so the
+  package's own `.exe` is run instead, and ping settings go in a file rather than inline JSON.
+- **Time zones without a tz database.** Stock Windows Python has no IANA database. The local
+  zone comes from `tzutil /g` mapped through CLDR's `windowsZones` table, and DST offsets for
+  the cloud cron come from the OS clock when `zoneinfo` can't load the zone.
+- **Locking** uses `fcntl` on POSIX and `msvcrt` on Windows.
+- **Verified** with the unit suite on Linux and on Windows Python 3.12 under Wine (including a
+  full install → report → status → uninstall cycle against Wine's Task Scheduler); CI runs the
+  suite on Linux, macOS and Windows. launchd itself is exercised only through mocks.
+
+## 6. Cloud runner
 
 Railway cron runs in UTC, at least 5 minutes apart, and can start a few minutes late. The
 cron expression is the smallest single expression covering every planned time under both
@@ -191,10 +220,10 @@ the Railway CLI, retrying when the network isn't back yet, and `primer status` p
 results back from the service logs. Days off (`primer skip`) travel with the schedule. The local
 timer stays on as a backup; a second ping in an open window is a no-op.
 
-## 6. Limits
+## 7. Limits
 
-- Local pings need the machine awake and the user logged in (`loginctl enable-linger` covers
-  logged-out, nothing covers suspend) — the cloud runner covers both.
+- Local pings need the machine awake and the user logged in — the cloud runner covers both
+  (Windows can also wake the PC with `wake_to_run`).
 - claude.ai / phone usage is only seen through limit hits and live readings.
 - Pinging doesn't add weekly quota.
 - Replays can't see work that would have happened during real lockouts, so gains are

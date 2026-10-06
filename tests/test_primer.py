@@ -10,11 +10,16 @@ from pathlib import Path
 
 _TMP = tempfile.mkdtemp()
 os.environ["PRIMER_DATA_DIR"] = _TMP
-os.environ["TZ"] = "America/Los_Angeles"
-time.tzset()
+# The tests assume Los Angeles local time. POSIX can switch per process; on Windows the CI job sets
+# the machine's zone with `tzutil /s "Pacific Standard Time"` instead.
+if hasattr(time, "tzset"):
+    os.environ["TZ"] = "America/Los_Angeles"
+    time.tzset()
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from primer import cloud, config, ingest, ping, planner, pricing, readings, sim, statusline, store  # noqa: E402
+from primer import cloud, config, ingest, ping, planner, pricing, readings, sim, statusline, store, system  # noqa: E402
+
+HAVE_TZDB = system.zone("America/Los_Angeles") is not None
 
 CFG = dict(config.DEFAULTS)
 
@@ -339,7 +344,7 @@ class RealWorld(unittest.TestCase):
 class PingRun(unittest.TestCase):
     def setUp(self):
         self.db = store.connect(":memory:")
-        self.cfg = dict(CFG, claude_bin="/bin/true", ping_retries=1)
+        self.cfg = dict(CFG, claude_bin=sys.executable, ping_retries=1)
 
     def tearDown(self):
         self.db.close()
@@ -392,7 +397,8 @@ class PingRun(unittest.TestCase):
     def test_command_disables_hooks_and_tools(self):
         cmd = ping.ping_command(self.cfg)
         self.assertIn("--safe-mode", cmd)
-        self.assertIn('{"disableAllHooks":true}', cmd)
+        settings = json.loads(Path(cmd[cmd.index("--settings") + 1]).read_text())
+        self.assertEqual(settings, {"disableAllHooks": True})
         self.assertEqual(cmd[cmd.index("--tools") + 1], "")
 
 
@@ -465,6 +471,7 @@ class Statusline(unittest.TestCase):
         self.assertEqual(statusline._epoch(1790843400000), 1790843400.0)
 
 
+@unittest.skipUnless(HAVE_TZDB, "needs a tz database (pip install tzdata on Windows)")
 class Cloud(unittest.TestCase):
     SCHED = {"Tue": ["09:21", "16:21"], "Sun": ["09:21"]}
     TZ = "America/Los_Angeles"
@@ -485,6 +492,16 @@ class Cloud(unittest.TestCase):
         self.assertIsNotNone(cloud.due(self.SCHED, self.TZ, datetime(2026, 12, 1, 9, 21, tzinfo=tz)))
         # a day off
         self.assertIsNone(cloud.due(self.SCHED, self.TZ, tue, skip={"2026-09-29"}))
+
+    def test_without_tz_database_falls_back_to_os_local_time(self):
+        original = system.zone
+        system.zone = lambda name: None
+        try:
+            self.assertEqual(cloud.cron_for(self.SCHED, self.TZ), "21 0,16,17,23 * * *")
+            tue = datetime(2026, 9, 29, 9, 24)  # naive = local
+            self.assertEqual(cloud.due(self.SCHED, self.TZ, tue).strftime("%a %H:%M"), "Tue 09:21")
+        finally:
+            system.zone = original
 
     def test_sync_retries_then_records_state(self):
         calls = []
@@ -521,6 +538,160 @@ class Cloud(unittest.TestCase):
             db.close()
         finally:
             cloud._railway = original
+
+
+class Backends(unittest.TestCase):
+    SCHED = {"Mon": ["10:51", "17:31"], "Sat": ["10:51"], "Sun": ["17:31"], "Tue": []}
+
+    def test_launchd_plist(self):
+        import plistlib
+        from primer.backends import launchd
+        job = plistlib.loads(launchd.ping_plist(self.SCHED))
+        self.assertEqual(job["ProgramArguments"][:2], [sys.executable, str(system.ENTRY)])
+        self.assertEqual(job["ProgramArguments"][2:], ["ping", "--scheduled"])
+        self.assertIn({"Weekday": 1, "Hour": 10, "Minute": 51}, job["StartCalendarInterval"])  # Monday
+        self.assertIn({"Weekday": 0, "Hour": 17, "Minute": 31}, job["StartCalendarInterval"])  # Sunday
+        self.assertEqual(len(job["StartCalendarInterval"]), 4)
+        self.assertIn("PATH", job["EnvironmentVariables"])
+        self.assertFalse(job["RunAtLoad"])
+        replan = plistlib.loads(launchd.replan_plist())
+        self.assertEqual(replan["StartCalendarInterval"], [{"Hour": 4, "Minute": 5}])
+
+    def test_task_scheduler_xml(self):
+        import xml.etree.ElementTree as ET
+        from primer.backends import taskscheduler
+        ns = {"t": "http://schemas.microsoft.com/windows/2004/02/mit/task"}
+        root = ET.fromstring(taskscheduler.ping_xml(self.SCHED, wake=True).encode("utf-16"))
+        triggers = root.findall(".//t:CalendarTrigger", ns)
+        by_time = {t.find("t:StartBoundary", ns).text[-8:]: sorted(c.tag.split("}")[1] for c in
+                   t.find(".//t:DaysOfWeek", ns)) for t in triggers}
+        self.assertEqual(by_time, {"10:51:00": ["Monday", "Saturday"], "17:31:00": ["Monday", "Sunday"]})
+        self.assertEqual(root.find(".//t:StartWhenAvailable", ns).text, "false")
+        self.assertEqual(root.find(".//t:WakeToRun", ns).text, "true")
+        self.assertEqual(root.find(".//t:LogonType", ns).text, "InteractiveToken")
+        self.assertIn(str(system.ENTRY), root.find(".//t:Arguments", ns).text)
+        self.assertTrue(root.find(".//t:Arguments", ns).text.endswith("ping --scheduled"))
+        replan = ET.fromstring(taskscheduler.replan_xml().encode("utf-16"))
+        self.assertEqual(replan.find(".//t:StartWhenAvailable", ns).text, "true")
+        self.assertIsNotNone(replan.find(".//t:ScheduleByDay", ns))
+
+    def test_systemd_service_runs_pinned_interpreter(self):
+        from primer.backends import systemd
+        unit = systemd._service("x", "ping --scheduled")
+        line = next(l for l in unit.splitlines() if l.startswith("ExecStart="))
+        self.assertIn(str(system.ENTRY), line)
+        self.assertTrue(line.endswith("ping --scheduled"))
+        self.assertIn(sys.executable, line)
+
+    def test_launchd_reloads_only_on_change(self):
+        from primer.backends import launchd
+        calls = []
+        original = (launchd.AGENTS, launchd.launchctl, launchd.os.getuid if hasattr(launchd.os, "getuid") else None)
+        launchd.AGENTS = Path(tempfile.mkdtemp())
+        launchd.launchctl = lambda *a: calls.append(a) or subprocess.CompletedProcess(a, 0, "", "")
+        if not hasattr(launchd.os, "getuid"):
+            launchd.os.getuid = lambda: 501
+        try:
+            launchd.install(self.SCHED)
+            self.assertEqual([c[0] for c in calls], ["bootout", "bootstrap", "bootout", "bootstrap"])
+            calls.clear()
+            self.assertEqual(launchd.sync(self.SCHED), "ping job unchanged")
+            self.assertEqual(calls, [])
+            self.assertEqual(launchd.sync({"Mon": []}), "ping job removed (no pings planned)")
+            self.assertFalse((launchd.AGENTS / f"{launchd.PING}.plist").exists())
+        finally:
+            launchd.AGENTS, launchd.launchctl = original[0], original[1]
+            if original[2] is None:
+                del launchd.os.getuid
+
+    def test_facade_picks_this_os(self):
+        from primer import scheduler
+        expected = {"linux": "systemd", "macos": "launchd", "windows": "Task Scheduler"}.get(system.OS)
+        self.assertEqual(getattr(scheduler.backend(), "NAME", None), expected)
+
+
+class Portability(unittest.TestCase):
+    def setUp(self):
+        self._os = system.OS
+
+    def tearDown(self):
+        system.OS = self._os
+
+    def test_windows_zone_names_map_to_iana(self):
+        system.OS = "windows"
+        original_run, saved_tz = system.subprocess.run, os.environ.pop("TZ", None)
+        system.subprocess.run = lambda *a, **k: subprocess.CompletedProcess(a, 0, "Pacific Standard Time\r\n", "")
+        try:
+            self.assertEqual(system.local_tz_name(), "America/Los_Angeles")
+            system.subprocess.run = lambda *a, **k: subprocess.CompletedProcess(a, 0, "W. Europe Standard Time_dstoff", "")
+            self.assertEqual(system.local_tz_name(), "Europe/Berlin")
+        finally:
+            system.subprocess.run = original_run
+            if saved_tz is not None:
+                os.environ["TZ"] = saved_tz
+
+    def test_npm_cmd_wrapper_resolves_to_real_exe(self):
+        system.OS = "windows"
+        d = Path(tempfile.mkdtemp())
+        shim = d / "claude.cmd"
+        shim.write_text("@echo off")
+        real = d / "node_modules/@anthropic-ai/claude-code/bin/claude.exe"
+        real.parent.mkdir(parents=True)
+        real.write_text("")
+        original = system.shutil.which
+        system.shutil.which = lambda name: str(shim)
+        try:
+            self.assertEqual(system.find_program("claude"), str(real))
+        finally:
+            system.shutil.which = original
+
+    def test_file_lock_is_exclusive(self):
+        path = Path(tempfile.mkdtemp()) / "lock"
+        with system.file_lock(path):
+            with self.assertRaises(BlockingIOError):
+                with system.file_lock(path):
+                    pass
+        with system.file_lock(path):  # released
+            pass
+
+    def test_launchers(self):
+        files = system.launcher_files()
+        for path, content in files.items():
+            self.assertIn(system.LAUNCHER_MARK, content)
+            # cmd.exe gets native paths; sh scripts (incl. Git Bash on Windows) get forward slashes
+            native = path.suffix == ".cmd" or system.OS != "windows"
+            self.assertIn(str(system.ENTRY) if native else Path(system.ENTRY).as_posix(), content)
+        system.OS = "windows"
+        names = sorted(p.name for p in system.launcher_files())
+        self.assertEqual(names, ["primer", "primer.cmd"])
+
+    def test_pins_stable_python_name_when_it_is_the_same_interpreter(self):
+        if system.OS == "windows":
+            self.skipTest("POSIX naming")
+        d = Path(tempfile.mkdtemp())
+        versioned = d / "python3.99"
+        versioned.write_text("")
+        (d / "python3").symlink_to(versioned)
+        original_exe, original_which = sys.executable, system.shutil.which
+        sys.executable = str(versioned)
+        try:
+            system.shutil.which = lambda name: str(d / "python3")
+            self.assertEqual(system.python(), d / "python3")
+            system.shutil.which = lambda name: "/somewhere/else/python3"  # a different interpreter
+            self.assertEqual(system.python(), versioned)
+        finally:
+            sys.executable, system.shutil.which = original_exe, original_which
+
+    def test_data_dir_per_os(self):
+        saved = os.environ.pop("PRIMER_DATA_DIR")
+        try:
+            system.OS = "macos"
+            self.assertTrue(str(system.data_dir("x")).endswith(os.path.join("Library", "Application Support", "x")))
+            system.OS = "windows"
+            self.assertTrue(str(system.data_dir("x")).endswith("x"))
+            self.assertIn("Local", str(system.data_dir("x")))
+        finally:
+            os.environ["PRIMER_DATA_DIR"] = saved
 
 
 if __name__ == "__main__":

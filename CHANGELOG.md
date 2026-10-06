@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- macOS (launchd) and Windows (Task Scheduler) support; one Python entry point
+  (`bin/primer.py`) run with a pinned interpreter everywhere.
 - Partial pooling (empirical Bayes) between shared and per-weekday schedules.
 - Work blocked by past lockouts is estimated so the optimiser can see it.
 - Budget estimates fade with a 7-day half-life; limits change often.

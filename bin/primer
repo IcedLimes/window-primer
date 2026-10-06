@@ -1,4 +1,27 @@
 #!/bin/sh
-# window-primer CLI. Resolves its own location so it works through symlinks and from systemd.
-ROOT=$(dirname "$(dirname "$(readlink -f "$0")")")
-PYTHONPATH="$ROOT${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m primer "$@"
+# window-primer CLI for sh/bash (Linux, macOS, Git Bash on Windows).
+# Uses the interpreter `primer install` recorded, else the first Python >= 3.11 it can find.
+SELF=$0
+while [ -h "$SELF" ]; do  # follow symlinks (1.0 installed one); no `readlink -f` on older macOS
+  LINK=$(readlink "$SELF")
+  case $LINK in /*) SELF=$LINK ;; *) SELF=$(dirname "$SELF")/$LINK ;; esac
+done
+ROOT=$(cd "$(dirname "$SELF")/.." && pwd -P)
+PY=${PRIMER_PYTHON:-}
+if [ -z "$PY" ] && [ -f "$ROOT/bin/.python" ]; then
+  PY=$(head -n 1 "$ROOT/bin/.python")
+fi
+if [ -z "$PY" ] || ! "$PY" -c '' 2>/dev/null; then
+  PY=
+  for c in python3.14 python3.13 python3.12 python3.11 python3 python; do
+    if command -v "$c" >/dev/null 2>&1 && "$c" -c 'import sys; sys.exit(sys.version_info < (3, 11))' 2>/dev/null; then
+      PY=$c
+      break
+    fi
+  done
+fi
+if [ -z "$PY" ]; then
+  echo "window-primer: no Python 3.11+ found (set PRIMER_PYTHON)" >&2
+  exit 1
+fi
+exec "$PY" "$ROOT/bin/primer.py" "$@"

@@ -163,7 +163,7 @@ def status(db, plan, cfg, timer_line=None):
     if future_skips:
         out.append("Days off:      " + ", ".join(future_skips))
     if timer_line:
-        out.append(f"systemd:       {timer_line}")
+        out.append(f"scheduler:     {timer_line}")
     pings = db.execute("SELECT * FROM pings ORDER BY ts DESC LIMIT 6").fetchall()
     if pings:
         out.append("Recent pings:")

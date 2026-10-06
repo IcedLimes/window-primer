@@ -1,31 +1,37 @@
 """Send the tiny message that opens a usage window, and record what the API says about it."""
 
 import json
-import os
-import shutil
 import subprocess
 import time
 from pathlib import Path
 
-from . import config, store
+from . import config, store, system
 
-NO_HOOKS_SETTINGS = '{"disableAllHooks":true}'
+NO_HOOKS_SETTINGS = {"disableAllHooks": True}
 
 
 def find_claude(cfg):
-    candidates = [cfg.get("claude_bin"), shutil.which("claude"),
-                  str(Path.home() / ".npm-global/bin/claude"), str(Path.home() / ".local/bin/claude"),
-                  str(Path.home() / ".claude/local/claude")]
-    for c in candidates:
-        if c and os.access(c, os.X_OK):
-            return c
-    raise FileNotFoundError("claude CLI not found; set claude_bin with `primer config claude_bin /path/to/claude`")
+    if cfg.get("claude_bin") and Path(cfg["claude_bin"]).exists():
+        return cfg["claude_bin"]
+    exe = system.find_program("claude", system.program_candidates("claude"))
+    if not exe:
+        raise FileNotFoundError("claude CLI not found; set claude_bin with `primer config claude_bin /path/to/claude`")
+    return exe
+
+
+def _settings_file():
+    # A file rather than inline JSON: quotes in arguments don't survive every Windows launcher.
+    path = config.DATA_DIR / "ping-settings.json"
+    if not path.exists():
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(NO_HOOKS_SETTINGS))
+    return str(path)
 
 
 def ping_command(cfg):
     # --safe-mode + disableAllHooks: no plugins, MCP servers or hooks (a sound-playing Stop hook would fire at 7 am).
     # --tools "": smallest possible request. --no-session-persistence: keep pings out of your transcripts.
-    return [find_claude(cfg), "-p", "--safe-mode", "--settings", NO_HOOKS_SETTINGS,
+    return [find_claude(cfg), "-p", "--safe-mode", "--settings", _settings_file(),
             "--model", cfg["ping_model"], "--tools", "", "--strict-mcp-config",
             "--no-session-persistence", "--output-format", "stream-json", "--verbose", cfg["ping_prompt"]]
 

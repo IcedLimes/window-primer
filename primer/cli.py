@@ -1,18 +1,14 @@
 """primer — command-line entry point."""
 
 import argparse
-import fcntl
 import json
-import os
 import shutil
 import sys
 import time
-from pathlib import Path
 
-from . import cloud, config, ingest, planner, render, scheduler, store
+from . import cloud, config, ingest, planner, render, scheduler, store, system
 
-ROOT = Path(__file__).resolve().parent.parent
-LOCAL_BIN = Path.home() / ".local/bin/primer"
+ROOT = system.ROOT
 PLUGIN_LINK = config.CLAUDE_DIR / "skills/primer"
 
 
@@ -35,29 +31,31 @@ def cmd_refresh(args, cfg):
         plan = _load_plan()
         if plan and time.time() - plan["generated_at"] < args.if_stale * 3600:
             return 0
-    config.DATA_DIR.mkdir(parents=True, exist_ok=True)
-    with open(config.DATA_DIR / ".refresh.lock", "w") as lock:
-        try:
-            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except BlockingIOError:
-            return 0  # another refresh (timer or hook) is already running
-        db = store.connect()
-        ingest.ingest(db)
-        result, hist = planner.plan(db, cfg)
-        old = _load_plan()
-        _save_plan(result)
-        timer = scheduler.sync(result["schedule"])
-        remote = cloud.sync(cfg, result["schedule"])
-        cloud.pull_results(cfg, db)
+    try:
+        with system.file_lock(config.DATA_DIR / ".refresh.lock"):
+            return _refresh(args, cfg)
+    except BlockingIOError:
+        return 0  # another refresh (timer or hook) is already running
+
+
+def _refresh(args, cfg):
+    db = store.connect()
+    ingest.ingest(db)
+    result, hist = planner.plan(db, cfg)
+    old = _load_plan()
+    _save_plan(result)
+    timer = scheduler.sync(result["schedule"])
+    remote = cloud.sync(cfg, result["schedule"])
+    cloud.pull_results(cfg, db)
     if remote and remote.startswith("cloud sync failed"):
-        print(remote, file=sys.stderr)  # lands in the journal even with --quiet; retried next refresh
+        print(remote, file=sys.stderr)  # lands in the log even with --quiet; retried next refresh
     if not args.quiet:
         sched = {d: t for d, t in result["schedule"].items() if t}
         print(f"Plan: {result['reason']}")
         print("Pings: " + ("  ".join(f"{d} {', '.join(t)}" for d, t in sched.items()) if sched else "none"))
         if old and old.get("schedule") != result["schedule"]:
             print("(schedule changed since the last plan)")
-        print(f"systemd: {timer}")
+        print(f"scheduler: {timer}")
         if remote:
             print(f"railway: {remote}")
     return 0
@@ -88,7 +86,7 @@ def cmd_ping(args, cfg):
         # past today, and fires late after resume from suspend. Only ping when a planned time was
         # within the last 15 minutes; anything else would open a window at a random moment.
         plan = _load_plan() or {}
-        planned = cloud.due(plan.get("schedule", {}), cloud.local_tz_name(), late_ok_min=15,
+        planned = cloud.due(plan.get("schedule", {}), system.local_tz_name(), late_ok_min=15,
                             skip=set(cfg.get("skip_dates", [])))
         if planned is None:
             print("not due: no planned ping in the last 15 minutes")
@@ -116,7 +114,7 @@ def cmd_cloud(args, cfg):
         print(f"{cloud.pull_results(cfg, store.connect())} new cloud ping result(s)")
     elif args.action == "cron":
         plan = _load_plan() or {"schedule": {}}
-        print(cloud.cron_for(plan["schedule"], cloud.local_tz_name()))
+        print(cloud.cron_for(plan["schedule"], system.local_tz_name()))
     return 0
 
 
@@ -169,7 +167,7 @@ def cmd_config(args, cfg):
 
 
 def _statusline_command():
-    return f"{LOCAL_BIN} statusline"
+    return system.shell_command("statusline")
 
 
 def _install_statusline():
@@ -183,12 +181,13 @@ def _install_statusline():
         return f"left your existing statusLine alone ({current.get('command')}); live readings will come from pings only"
     if current and current.get("command") == _statusline_command():
         return "statusLine already installed"
-    backup = settings_path.with_name(f"settings.json.primer-backup-{int(time.time())}")
-    if settings_path.exists():
+    # One backup, taken before primer first touched the file, so it always holds your original.
+    backup = settings_path.with_name("settings.json.primer-backup")
+    if settings_path.exists() and not backup.exists() and not current:
         shutil.copy2(settings_path, backup)
     settings["statusLine"] = {"type": "command", "command": _statusline_command(), "refreshInterval": 60}
     settings_path.write_text(json.dumps(settings, indent=2) + "\n")
-    return f"statusLine installed in {settings_path} (backup: {backup.name})"
+    return f"statusLine installed in {settings_path}" + (f" (backup: {backup.name})" if backup.exists() else "")
 
 
 def _uninstall_statusline():
@@ -203,22 +202,16 @@ def _uninstall_statusline():
     return "statusLine removed"
 
 
-def _link(link, target):
-    link.parent.mkdir(parents=True, exist_ok=True)
-    if link.is_symlink() or link.exists():
-        if link.is_symlink() and Path(os.readlink(link)) == target:
-            return f"{link} already linked"
-        if not link.is_symlink():
-            return f"{link} exists and isn't a symlink; left alone"
-        link.unlink()
-    link.symlink_to(target)
-    return f"linked {link} → {target}"
-
-
 def cmd_install(args, cfg):
-    steps = [_link(LOCAL_BIN, ROOT / "bin/primer")]
+    if sys.version_info < (3, 11):
+        print(f"window-primer needs Python 3.11 or newer (this is {sys.version.split()[0]}); "
+              "run install with a newer python, e.g. `python3.12 bin/primer.py install`", file=sys.stderr)
+        return 2
+    steps = system.install_launchers()
+    # bin/primer (used by the plugin's hook) reads this to find the same interpreter.
+    (ROOT / "bin" / ".python").write_text(str(system.python()) + "\n")
     if not args.no_plugin:
-        steps.append(_link(PLUGIN_LINK, ROOT))
+        steps.append(system.link_dir(PLUGIN_LINK, ROOT))
     if not args.no_statusline:
         steps.append(_install_statusline())
     db = store.connect()
@@ -235,12 +228,12 @@ def cmd_install(args, cfg):
 
 def cmd_uninstall(args, cfg):
     scheduler.uninstall()
-    print("• systemd units removed")
+    print("• scheduled jobs removed")
     print("•", _uninstall_statusline())
-    for link in (PLUGIN_LINK, LOCAL_BIN):
-        if link.is_symlink():
-            link.unlink()
-            print(f"• removed {link}")
+    if system.unlink_dir(PLUGIN_LINK):
+        print(f"• removed {PLUGIN_LINK}")
+    for path in system.remove_launchers():
+        print(f"• removed {path}")
     print(f"Data kept in {config.DATA_DIR} (delete it to forget everything).")
     return 0
 
@@ -275,5 +268,6 @@ def main(argv=None):
     i.add_argument("--no-plugin", action="store_true")
     sub.add_parser("uninstall", help="remove timers, statusline and links (keeps data)")
     args = p.parse_args(argv)
+    system.utf8_stdio()
     cfg = config.load()
     return globals()[f"cmd_{args.cmd}"](args, cfg)

@@ -27,27 +27,47 @@ it schedules nothing.
 
 ## Requirements
 
-- Linux with a systemd user session (for the local timers)
-- Python ≥ 3.11 (standard library only)
+- Linux, macOS or Windows 10/11
+- Python ≥ 3.11 (standard library only; on Windows, `pip install tzdata` is recommended)
 - [Claude Code](https://code.claude.com) signed in with a Claude subscription
 - Optional: a [Railway](https://railway.com) account and the Railway CLI for the cloud runner
 
+| | Local scheduler | Data | `primer` command |
+|---|---|---|---|
+| Linux | systemd user timers | `~/.local/share/window-primer` | `~/.local/bin/primer` |
+| macOS | launchd LaunchAgents | `~/Library/Application Support/window-primer` | `~/.local/bin/primer` |
+| Windows | Task Scheduler (`\window-primer\`) | `%LOCALAPPDATA%\window-primer` | `primer` / `primer.cmd` in `%LOCALAPPDATA%\Microsoft\WindowsApps` |
+
 ## Install
+
+Linux and macOS:
 
 ```sh
 git clone https://github.com/IcedLimes/window-primer.git ~/Projects/window-primer
 cd ~/Projects/window-primer
-bin/primer install
+python3 bin/primer.py install     # use a Python ≥ 3.11, e.g. python3.12 on macOS
 primer report
 ```
 
-`primer install`:
+Windows (PowerShell):
 
-- links `~/.local/bin/primer` and the Claude Code plugin (`~/.claude/skills/primer` → `primer@skills-dir`)
-- adds a statusline to `~/.claude/settings.json` (backs it up first; skipped if you already have one)
-- installs `primer-ping.timer` and a daily `primer-replan.timer` as systemd user units
+```powershell
+git clone https://github.com/IcedLimes/window-primer.git $HOME\Projects\window-primer
+cd $HOME\Projects\window-primer
+py -3 -m pip install --user tzdata
+py -3 bin\primer.py install
+primer report
+```
 
-`primer uninstall` reverses all of it and keeps your data in `~/.local/share/window-primer`.
+`primer install` pins the Python it was run with, then:
+
+- writes the `primer` command and links the Claude Code plugin (`~/.claude/skills/primer` →
+  `primer@skills-dir`; a directory junction on Windows, so no admin rights are needed)
+- adds a statusline to `~/.claude/settings.json` (keeps one backup of your original; skipped if
+  you already have a statusline of your own)
+- schedules the ping job and a daily re-plan job with the OS scheduler above
+
+`primer uninstall` reverses all of it and keeps your data.
 
 ## Use
 
@@ -131,7 +151,9 @@ stays on as a backup; if both fire, the second ping lands in an open window and 
 
 ## Limits
 
-- Local pings need the machine awake and you logged in; the cloud runner covers both.
+- Local pings need the machine awake and you logged in; the cloud runner covers both. On
+  Windows, `primer config wake_to_run true` lets Task Scheduler wake the PC for a ping (wake
+  timers must be allowed in the power plan).
 - Usage on claude.ai or other devices is only seen through limit hits and live readings.
 - Pinging moves your 5-hour windows; it doesn't add weekly quota.
 - It reads fields Claude Code emits today (`rate_limit_event` in `stream-json`, `rate_limits`

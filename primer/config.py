@@ -4,10 +4,11 @@ import json
 import os
 from pathlib import Path
 
+from . import system
+
 APP = "window-primer"
 
-DATA_DIR = Path(os.environ.get("PRIMER_DATA_DIR")
-                or Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share") / APP)
+DATA_DIR = system.data_dir(APP)
 CLAUDE_DIR = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude")
 PROJECTS_DIR = CLAUDE_DIR / "projects"
 CLAUDE_SETTINGS = CLAUDE_DIR / "settings.json"
@@ -62,6 +63,9 @@ DEFAULTS = {
     "ping_timeout_s": 90,
     "ping_retries": 2,
     "claude_bin": None,
+    # Windows only: let Task Scheduler wake the PC from sleep for a ping (needs wake timers allowed
+    # in the power plan). macOS and Linux can't do this without root; use the cloud runner instead.
+    "wake_to_run": False,
     # Local dates (YYYY-MM-DD) with no pings, e.g. holidays. Managed with `primer skip`.
     "skip_dates": [],
     # Railway cron runner: {"project": id, "environment": id, "service": id}; set by `primer cloud link`.
