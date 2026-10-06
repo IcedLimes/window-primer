@@ -1,5 +1,5 @@
 ---
-description: Re-read usage history now, re-plan ping times and update the systemd timer
+description: Re-read usage history now, re-plan ping times and update the scheduled ping jobs
 allowed-tools: Bash(primer:*)
 ---
 !`primer refresh`

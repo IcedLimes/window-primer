@@ -40,6 +40,10 @@ it schedules nothing.
 
 ## Install
 
+Download a package from the [latest release](https://github.com/IcedLimes/window-primer/releases/latest)
+(`…-linux.tar.gz`, `…-macos.tar.gz` or `…-windows.zip`, checksums in `SHA256SUMS`) and extract it
+where it can stay, or clone the repo. Then install from that folder.
+
 Linux and macOS:
 
 ```sh
@@ -67,7 +71,11 @@ primer report
   you already have a statusline of your own)
 - schedules the ping job and a daily re-plan job with the OS scheduler above
 
-`primer uninstall` reverses all of it and keeps your data.
+`primer uninstall` reverses all of it and keeps your data. Keep the folder you installed from in
+place: the scheduled jobs, the `primer` command and the plugin link all point to it.
+
+**Upgrading from 1.0:** extract (or `git pull`) the new version, run its `install` as above — it
+replaces 1.0's launcher and jobs — then delete the old folder if it was a separate one.
 
 ## Use
 
@@ -97,8 +105,9 @@ haven't used one in the past week, since it's rationed.
 1. Every response in `~/.claude/projects/**` becomes an API-equivalent cost (its "intensity"),
    kept in a local sqlite store so it outlives Claude Code's transcript cleanup.
 2. The per-window budget is calibrated from your real limit-hit messages and live utilization
-   readings (statusline + pings). Limits change every few months, so the planner hedges across
-   all estimates with a one-week half-life.
+   readings (statusline + pings), reading through stale values from idle sessions. A plan upgrade,
+   downgrade or limit reset is detected automatically and only data since then counts; within that,
+   the planner hedges across all estimates with a one-week half-life.
 3. A simulator replays your history under candidate ping times — windows open at the first
    request, floored to 10 minutes, and last 5 hours; a ping inside an open window does nothing.
    Work you were locked out of is estimated, so the hours a better ping would rescue count.
@@ -133,7 +142,9 @@ built from `cloud/Dockerfile`; it uses the same ping and decides in your local t
 whether a ping is due, so DST and per-weekday plans just work. Its cost is a few seconds of
 compute per run.
 
-1. Install and sign in to the Railway CLI (`npm i -g @railway/cli`, `railway login`).
+1. Install and sign in to the Railway CLI: `curl -fsSL https://railway.com/install.sh | sh`, or with
+   npm `npm i -g --allow-scripts=@railway/cli @railway/cli` (npm 12+ blocks the package's setup
+   script otherwise, leaving a `railway` command with no binary behind it); then `railway login`.
 2. Create an empty service, then set its Dockerfile path to `cloud/Dockerfile`
    (Settings → Build, or the variable `RAILWAY_DOCKERFILE_PATH=cloud/Dockerfile`).
 3. From the repo root:
@@ -158,6 +169,8 @@ stays on as a backup; if both fire, the second ping lands in an open window and 
 - Pinging moves your 5-hour windows; it doesn't add weekly quota.
 - It reads fields Claude Code emits today (`rate_limit_event` in `stream-json`, `rate_limits`
   in statusline input) that aren't formally documented and may change.
+- The test suite passes on Linux, macOS and Windows, but launchd jobs haven't yet run on a real Mac
+  (only through mocks). If a macOS ping doesn't fire, please open an issue.
 
 ## Development
 

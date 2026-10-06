@@ -12,7 +12,7 @@ Use the `primer` CLI (on PATH):
 
 - `primer status` — open window, % used, reset time, weekly %, next pings, recent ping outcomes.
 - `primer report` — weekday × time heatmap, calibrated budget, schedule, replay and cross-validation.
-- `primer refresh` — re-plan now and update the systemd timer.
+- `primer refresh` — re-plan now and update the scheduled jobs (systemd, launchd or Task Scheduler, plus the cloud runner if linked).
 - `primer ping` — open a window now (no-op if one is already open; `--force` to send anyway).
 - `primer config [key [value]]` — settings. Useful keys: `ping_hours` (e.g. `[7,23]` if the
   machine sleeps at night), `max_pings_per_day`, `mode` (`auto`/`global`/`weekday`),
